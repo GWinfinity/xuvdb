@@ -38,8 +38,8 @@ uv pip install .            # 或 pip install .
 uv pip install -e ".[test]" # 开发模式 + pytest
 ```
 
-可选 extras：`[openvdb]`（pyopenvdb 内存级互转）、`[genesis]`（运行引擎侧示例需要 genesis-world）、
-`[test]`（pytest）。
+可选 extras：`[openvdb]`（pyopenvdb 内存级互转）、`[torch]`（torch 桥：张量往返 + 可微采样）、
+`[genesis]`（运行引擎侧示例需要 genesis-world）、`[test]`（pytest）。
 
 ## 快速上手
 
@@ -79,6 +79,21 @@ fog = xuvdb.VdbGrid(voxel_size=0.05, name="liquid", grid_class="fog volume")
 fog.scatter_particles(drops, h=4 * 0.05, weights=1.0)     # SPH cubic 核密度 splat
 surf = xuvdb.VdbGrid(background=3 * 0.05, voxel_size=0.05, grid_class="level set")
 surf.union_spheres(drops, radius=0.03)                    # particle level set 表面代理
+
+# 7) torch 桥（互通不做框架：张量往返 + 可微采样；pip install 'xuvdb[torch]'）
+from xuvdb.torch_bridge import grid_to_tensors, sample_t, tensors_to_grid
+t = grid_to_tensors(grid, device="cuda")            # keys/values/active -> tensors
+t["values"].requires_grad_(True)                    # 叶值张量可训练
+pts_t = torch.rand(64, 3, device="cuda", requires_grad=True)
+field = sample_t(t, pts_t, grid.voxel_size, grid.origin_world,
+                 grid.leaf_log2, grid.background)   # 前向 == sample_linear
+field.sum().backward()                              # 解析梯度: dL/dvalues + dL/dpoints
+back = tensors_to_grid(t, grid.voxel_size, grid.origin_world,
+                       grid.leaf_log2, grid.background, name=grid.name)
+
+# 8) 多网格批量打包（GridBatch 式：一次 launch 采样所有网格）
+batch = xuvdb.gpu.VolumeBatch([grid_a, grid_b])     # 各自的变换/叶尺寸都可不同
+vals = batch.sample(points, volume_ids)             # (m,3) 点 + 每点所属网格 id
 
 # 6) DDA 射线（空叶块按块跳过，交叉点二分细化到亚体素）
 t, point, value = xuvdb.ray_surface_hit(grid, (0.3, 0.2, 2.0), (0, 0, -1))

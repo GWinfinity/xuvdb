@@ -45,12 +45,15 @@ OpenVDB 流"。
 验收:Blosc 往返逐值一致;被篡改文件被 CRC 拦截;旋转网格采样/射线/两种格式往返与
 轴对齐数值一致;34+ 测试全绿。
 
-## v0.5 — torch 桥(fVDB 方向的克制版:做互通,不做框架)
+## v0.5 — torch 桥 ✅ 0.5.0(fVDB 方向的克制版:做互通,不做框架)
 
-- [ ] PointDataGrid 读侧(吃 Houdini 粒子缓存;需先收集真实测试文件);
-- [ ] 值缓冲 ⇄ `torch.Tensor`(含 CUDA 路径);
-- [ ] 可微采样包装(自定义 autograd function 包住 `GpuVolume.sample`);
-- [ ] 多网格批量打包/传输(GridBatch 式一次上下载)。
+- [x] 值缓冲 ⇄ `torch.Tensor`(`grid_to_tensors` / `tensors_to_grid`,任意 device;
+  f16/f64 上转 f32,轴对齐标量网格);
+- [x] 可微采样 `sample_t` / `sample`:自定义 autograd Function,对叶值(scatter-add)
+  和采样点(角权重解析导数)都有梯度,双向对有限差分校验;
+- [x] 多网格批量打包 `gpu.VolumeBatch`:多网格共享一份 key/value 缓冲,各自变换/叶尺寸,
+  `sample(points, volume_ids)` 一次 launch 全部采样(分段二分);
+- [ ] PointDataGrid 读侧 → 继续顺延:仍无真实 Houdini 粒子缓存可验证(不可测不发布)。
 
 不做:稀疏卷积 / attention / 训练算子——正确姿势是提供导出接口。
 

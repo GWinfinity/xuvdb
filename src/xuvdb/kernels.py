@@ -510,6 +510,93 @@ def kernel_ray_surface_hit(
 
 
 @qd.func
+def xuvdb_find_leaf_seg(keys: qd.types.ndarray(ndim=1), lo: int, hi: int,
+                        kx: qd.i64, ky: qd.i64, kz: qd.i64) -> int:
+    """Binary search restricted to keys[lo:hi] - the segment of one volume in a batch."""
+    key = xuvdb_pack_key(kx, ky, kz)
+    l = lo
+    h = hi
+    while l < h:
+        mid = (l + h) // 2
+        if keys[mid] < key:
+            l = mid + 1
+        else:
+            h = mid
+    found = l
+    if l >= hi or keys[l] != key:
+        found = -1
+    return found
+
+
+@qd.func
+def xuvdb_voxel_value_seg(keys: qd.types.ndarray(ndim=1), values: qd.types.ndarray(ndim=1),
+                          lo: int, hi: int, leaf_log2: int, background: qd.f64,
+                          xi: qd.i64, yi: qd.i64, zi: qd.i64) -> qd.f64:
+    dim = 1 << leaf_log2
+    leaf_idx = xuvdb_find_leaf_seg(keys, lo, hi, xi >> leaf_log2, yi >> leaf_log2, zi >> leaf_log2)
+    lx = xi & qd.i64(dim - 1)
+    ly = yi & qd.i64(dim - 1)
+    lz = zi & qd.i64(dim - 1)
+    n = lx * qd.i64(dim * dim) + ly * qd.i64(dim) + lz
+    value = background
+    if leaf_idx >= 0:
+        value = values[leaf_idx * qd.i64(dim * dim * dim) + n]
+    return value
+
+
+@qd.func
+def xuvdb_sample_linear_seg(keys: qd.types.ndarray(ndim=1), values: qd.types.ndarray(ndim=1),
+                            lo: int, hi: int, leaf_log2: int, background: qd.f64,
+                            o_x: qd.f64, o_y: qd.f64, o_z: qd.f64,
+                            s_x: qd.f64, s_y: qd.f64, s_z: qd.f64,
+                            x: qd.f64, y: qd.f64, z: qd.f64) -> qd.f64:
+    cx = (x - o_x) / s_x
+    cy = (y - o_y) / s_y
+    cz = (z - o_z) / s_z
+    bx = qd.floor(cx)
+    by = qd.floor(cy)
+    bz = qd.floor(cz)
+    fx = cx - bx
+    fy = cy - by
+    fz = cz - bz
+    out = qd.f64(0.0)
+    for dx in qd.static(range(2)):
+        wx = fx if dx == 1 else 1.0 - fx
+        for dy in qd.static(range(2)):
+            wy = fy if dy == 1 else 1.0 - fy
+            for dz in qd.static(range(2)):
+                wz = fz if dz == 1 else 1.0 - fz
+                out += wx * wy * wz * xuvdb_voxel_value_seg(
+                    keys, values, lo, hi, leaf_log2, background,
+                    qd.i64(bx) + qd.i64(dx), qd.i64(by) + qd.i64(dy), qd.i64(bz) + qd.i64(dz))
+    return out
+
+
+@qd.kernel
+def kernel_sample_batch(keys: qd.types.ndarray(ndim=1),
+                        values: qd.types.ndarray(ndim=1),
+                        segs: qd.types.ndarray(ndim=1),        # (n_vol+1,) i32 volume segments
+                        leaf_log2s: qd.types.ndarray(ndim=1),  # (n_vol,) i32
+                        origins: qd.types.ndarray(ndim=2),     # (n_vol, 3) f64
+                        steps: qd.types.ndarray(ndim=2),       # (n_vol, 3) f64 voxel sizes
+                        backgrounds: qd.types.ndarray(ndim=1),  # (n_vol,) f64
+                        vol_ids: qd.types.ndarray(ndim=1),     # (m,) i32
+                        points: qd.types.ndarray(ndim=2),      # (m, 3) f32
+                        out: qd.types.ndarray(ndim=1)):        # (m,) f32
+    """Batched trilinear sampling across many packed volumes: each point picks its volume via
+    `vol_ids`, the binary search is confined to that volume's key segment. One launch total."""
+    for i in range(points.shape[0]):
+        v = int(vol_ids[i])
+        lo = int(segs[v])
+        hi = int(segs[v + 1])
+        out[i] = xuvdb_sample_linear_seg(
+            keys, values, lo, hi, int(leaf_log2s[v]), qd.f64(backgrounds[v]),
+            origins[v, 0], origins[v, 1], origins[v, 2],
+            steps[v, 0], steps[v, 1], steps[v, 2],
+            qd.f64(points[i, 0]), qd.f64(points[i, 1]), qd.f64(points[i, 2]))
+
+
+@qd.func
 def xuvdb_sample_quadratic(keys: qd.types.ndarray(ndim=1),
                            values: qd.types.ndarray(ndim=1),
                            n_leaves: int,

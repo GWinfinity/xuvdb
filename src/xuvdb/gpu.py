@@ -187,3 +187,47 @@ class GpuVolume:
             leaf.invalidate()  # kernel writes changed values: derived stats are stale
         self._dirty = False
         return self.grid
+
+
+class VolumeBatch:
+    """Many packed scalar grids sharing one key/value buffer - the GridBatch-style transfer.
+
+    Each member volume keeps its own transform (voxel size, origin, background, even leaf size);
+    `sample(points, volume_ids)` resolves every point against its volume's key segment in a
+    single kernel launch. Same packing constraints as `GpuVolume` (f32 scalar, axis-aligned)."""
+
+    def __init__(self, grids):
+        grids = list(grids)
+        if not grids:
+            raise ValueError("VolumeBatch needs at least one grid")
+        init_runtime()
+        self.volumes = [GpuVolume(g) for g in grids]  # validates the packing constraints
+        self.grids = [v.grid for v in self.volumes]
+        segments = [0]
+        for vol in self.volumes:
+            segments.append(segments[-1] + len(vol.keys))
+        self.keys = np.concatenate([v.keys for v in self.volumes])
+        self.values = np.concatenate([v.values for v in self.volumes])
+        self.segments = np.array(segments, dtype=np.int32)
+        self.leaf_log2s = np.array([g.leaf_log2 for g in self.grids], dtype=np.int32)
+        self.origins = np.stack([g.origin_world for g in self.grids]).astype(np.float64)
+        self.steps = np.stack([g.voxel_size for g in self.grids]).astype(np.float64)
+        self.backgrounds = np.array([v.background for v in self.volumes], dtype=np.float64)
+
+    def __len__(self):
+        return len(self.volumes)
+
+    def sample(self, points, volume_ids):
+        """Trilinear sampling across the batch: `(m, 3)` points, per-point `(m,)` volume ids."""
+        points = np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 3)
+        vol_ids = np.ascontiguousarray(volume_ids, dtype=np.int32).reshape(-1)
+        if len(vol_ids) != len(points):
+            raise ValueError("volume_ids must supply one id per point")
+        if len(vol_ids) and (vol_ids.min() < 0 or vol_ids.max() >= len(self.volumes)):
+            raise IndexError("volume id out of range")
+        out = np.empty(len(points), dtype=np.float32)
+        kernels.kernel_sample_batch(
+            self.keys, self.values, self.segments, self.leaf_log2s,
+            self.origins, self.steps, self.backgrounds, vol_ids, points, out,
+        )
+        return out

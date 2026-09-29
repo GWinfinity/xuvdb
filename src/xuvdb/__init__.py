@@ -45,9 +45,10 @@ from .openvdb_bridge import from_openvdb, to_openvdb
 from .openvdb_file import read_vdb, write_vdb
 from .ray import ray_surface_hit
 from .runtime import init_runtime
+from . import torch_bridge
 from .tree import Leaf, VdbGrid
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 __all__ = [
     "GpuVolume",

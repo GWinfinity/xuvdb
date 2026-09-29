@@ -21,6 +21,7 @@ genesis = ["genesis-world"]
 # in-memory OpenVDB bridge (to_openvdb / from_openvdb) via the official bindings
 openvdb = ["pyopenvdb"]
 test = ["pytest"]
+torch = ["torch"]
 
 [tool.setuptools.dynamic]
 version = { attr = "xuvdb.__version__" }
