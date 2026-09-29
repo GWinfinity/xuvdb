@@ -15,3 +15,7 @@ build/
 
 # demo output files (scene.xuvdb / scene.vdb etc.)
 demo_output/
+
+# root-level debug artifacts from ad-hoc runs
+/*.vdb
+/*.xuvdb
