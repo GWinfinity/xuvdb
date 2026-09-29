@@ -15,7 +15,7 @@ except ImportError:  # the module stays importable; the converters raise on use
 def _require_bindings():
     if pyopenvdb is None:
         raise ImportError(
-            "pyopenvdb is not installed; use genesis.xuvdb.openvdb_file.read_vdb/write_vdb for "
+            "pyopenvdb is not installed; use xuvdb.openvdb_file.read_vdb/write_vdb for "
             "file-level interop instead"
         )
 

@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# engine integration (import genesis.xuvdb alongside a working genesis install)
+# engine-side example (examples/test_packages.py) drives a genesis-world simulation
 genesis = ["genesis-world"]
 # in-memory OpenVDB bridge (to_openvdb / from_openvdb) via the official bindings
 openvdb = ["pyopenvdb"]

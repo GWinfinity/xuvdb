@@ -6,7 +6,7 @@
 `xuvdb` 取「太虚」之音：这是中文里对 VDB「无界而稀疏的索引域」最准确的翻译——无界
 （root 哈希域不设上限），无形（未分配的空间没有形态，采样即得背景值）。
 
-`genesis.xuvdb` 基于 quadrants 内核：**自己的 `.xuvdb` 格式**（可修改、可在内核里写值），
+`xuvdb` 基于 quadrants 内核：**自己的 `.xuvdb` 格式**（可修改、可在内核里写值），
 以及**与 OpenVDB 的双向互转**（原生 `.vdb` 文件读写，无需安装 OpenVDB；有 `pyopenvdb`
 绑定时还能内存级互转）。
 
@@ -15,7 +15,7 @@
 | 层 | 名字 | 规则 |
 |---|---|---|
 | 项目名 | `xuvdb` | 拼音；不用 Open 前缀（ASWF 语境下暗示基金会血统） |
-| 命名空间 / 扩展名 | `genesis.xuvdb` / `.xuvdb` | API 标识符一律英文：`xuvdb.prune()`、`xuvdb.VdbGrid`，绝不是 `xuvdb.sunyi()`。道家词只活在概念层（文档题词、日志、可视化标签） |
+| 命名空间 / 扩展名 | `xuvdb` / `.xuvdb` | API 标识符一律英文：`xuvdb.prune()`、`xuvdb.VdbGrid`，绝不是 `xuvdb.sunyi()`。道家词只活在概念层（文档题词、日志、可视化标签） |
 | 互转文件 | `.vdb` | **自有格式绝不写 `.vdb` 后缀**（Houdini／Blender／Cycles／Arnold 按扩展名当 OpenVDB 解析，格式不符时静默出错或崩溃，极难定位；`save()` 对 `.vdb` 路径直接拒绝）。要互通就单独导出：`write_vdb()` 产出真正的 OpenVDB 流 |
 
 ## 为什么是它
@@ -38,15 +38,14 @@ uv pip install .            # 或 pip install .
 uv pip install -e ".[test]" # 开发模式 + pytest
 ```
 
-可选 extras：`[genesis]`（引擎集成 genesis-world）、`[openvdb]`（pyopenvdb 内存级互转）。
-与 genesis 引擎同仓部署时，把 `src/xuvdb/` 挂为引擎包内的 `genesis/xuvdb/` 子模块，
-`import genesis.xuvdb` 与 `import xuvdb` 完全等价（两者不要在同进程混用：会得到两份模块实例）。
+可选 extras：`[openvdb]`（pyopenvdb 内存级互转）、`[genesis]`（运行引擎侧示例需要 genesis-world）、
+`[test]`（pytest）。
 
 ## 快速上手
 
 ```python
 import numpy as np
-import genesis.xuvdb as xuvdb
+import xuvdb
 
 # 1) 编辑：窄带 level set 球（体素 0.05，带宽 3 体素）
 grid = xuvdb.VdbGrid(background=3 * 0.05, voxel_size=0.05, leaf_log2=4,

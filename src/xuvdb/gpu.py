@@ -24,7 +24,7 @@ class GpuVolume:
 
     def __init__(self, grid):
         if not isinstance(grid, VdbGrid):
-            raise TypeError("GpuVolume wraps a genesis.xuvdb.VdbGrid")
+            raise TypeError("GpuVolume wraps an xuvdb.VdbGrid")
         if grid.is_vec or grid.type_code == 1:
             raise TypeError("kernel packing currently supports float32 scalar grids")
         if grid.n_leaves == 0:

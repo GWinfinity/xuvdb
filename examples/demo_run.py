@@ -12,10 +12,7 @@ import os
 
 import numpy as np
 
-try:
-    import genesis.xuvdb as xuvdb   # engine integration (monorepo / junction layout)
-except ImportError:
-    import xuvdb as xuvdb           # standalone install
+import xuvdb
 
 os.makedirs("demo_output", exist_ok=True)
 ok = lambda label, cond, detail="": print(f"  PASS  {label} {detail}") if cond else (_ for _ in ()).throw(AssertionError(label + " " + detail))
