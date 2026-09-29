@@ -20,10 +20,16 @@ def try_backend(arch):
     vol = xuvdb.GpuVolume(grid)
     pts = np.array([[0.3, 0.45, 0.1], [0.3, 0.2, 0.1]], np.float32)
     d = vol.sample(pts, linear=True)
+    q = vol.sample(pts, order=2)
+    q_host = [grid.sample_quadratic(p) for p in pts]
     hit = vol.ray_surface_hit((0.3, 0.2, 2.0), (0, 0, -1))
+    red = vol.reduce()
     assert abs(d[0]) < 2e-2 and abs(d[1] + 0.25) < 2e-2, d
+    assert np.allclose(q, q_host, atol=2e-5), (q, q_host)  # kernel quadratic == host quadratic
     assert hit is not None and abs(hit[2]) < 5e-2, hit
-    print(f"{arch}: sample={np.round(d, 4).tolist()}  ray t={hit[0]:.4f}  OK")
+    assert red["count"] == grid.active_voxel_count, red
+    print(f"{arch}: sample={np.round(d, 4).tolist()} quad={np.round(q, 4).tolist()} "
+          f"ray t={hit[0]:.4f} reduce={red}  OK")
 
 
 try_backend(qd.cpu)

@@ -66,7 +66,10 @@ back = xuvdb.read_vdb("scene.vdb", grid_name="shield")
 # 4) 内核采样 / 写值（等同 Warp example_nvdb 的用法，但值可写）
 vol = xuvdb.GpuVolume(grid)
 pts = np.array([[0.3, 0.2, 0.36]], dtype=np.float32)
-d = vol.sample(pts, linear=True)          # SDF 距离
+d = vol.sample(pts, linear=True)          # SDF 距离（order=0/1/2 也提供三次 B 样条）
+q = vol.sample(pts, order=2)              # 三次采样：C1 平滑（宿主侧 grid.sample_quadratic 同款）
+g = grid.sample_gradient(pts)             # 中心差分梯度（宿主）；stencil7/19_batch 供模板算子
+stats = vol.reduce()                      # active 求和/极值/计数（一次 kernel launch）
 n = vol.sdf_normal(pts)                   # 有限差分表面法向
 vol.write_voxels(pts, np.array([-0.01], np.float32)); vol.sync_to_host()
 

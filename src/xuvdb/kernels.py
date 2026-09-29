@@ -508,3 +508,93 @@ def kernel_ray_surface_hit(
         if hit == 0:
             out[r, 0] = 0.0
 
+
+@qd.func
+def xuvdb_sample_quadratic(keys: qd.types.ndarray(ndim=1),
+                           values: qd.types.ndarray(ndim=1),
+                           n_leaves: int,
+                           leaf_log2: int,
+                           background: float,
+                           o_x: float, o_y: float, o_z: float,
+                           s_x: float, s_y: float, s_z: float,
+                           x: float, y: float, z: float) -> float:
+    """Triquadratic sample (3x3x3 quadratic B-spline; weights [0.5(1-u)^2, 0.5+u-u^2, 0.5u^2]
+    per axis over taps floor(x)-1 .. floor(x)+1), matching the host `_sample_quadratic`."""
+    cx, cy, cz = (x - o_x) / s_x, (y - o_y) / s_y, (z - o_z) / s_z
+    bx, by, bz = qd.floor(cx), qd.floor(cy), qd.floor(cz)
+    fx, fy, fz = cx - bx, cy - by, cz - bz
+    out = qd.f32(0.0)
+    wj = qd.f32(0.0)
+    wk = qd.f32(0.0)
+    wl = qd.f32(0.0)
+    for j in qd.static(range(3)):
+        if j == 0:
+            wj = 0.5 * (1.0 - fx) * (1.0 - fx)
+        elif j == 1:
+            wj = 0.5 + fx - fx * fx
+        else:
+            wj = 0.5 * fx * fx
+        for k in qd.static(range(3)):
+            if k == 0:
+                wk = 0.5 * (1.0 - fy) * (1.0 - fy)
+            elif k == 1:
+                wk = 0.5 + fy - fy * fy
+            else:
+                wk = 0.5 * fy * fy
+            for l in qd.static(range(3)):
+                if l == 0:
+                    wl = 0.5 * (1.0 - fz) * (1.0 - fz)
+                elif l == 1:
+                    wl = 0.5 + fz - fz * fz
+                else:
+                    wl = 0.5 * fz * fz
+                out += qd.f32(wj * wk * wl) * xuvdb_voxel_value(
+                    keys, values, n_leaves, leaf_log2, background,
+                    qd.i64(bx) - 1 + j, qd.i64(by) - 1 + k, qd.i64(bz) - 1 + l)
+    return out
+
+
+@qd.kernel
+def kernel_sample_quadratic(keys: qd.types.ndarray(ndim=1),
+                            values: qd.types.ndarray(ndim=1),
+                            n_leaves: int,
+                            leaf_log2: int,
+                            background: float,
+                            o_x: float, o_y: float, o_z: float,
+                            s_x: float, s_y: float, s_z: float,
+                            points: qd.types.ndarray(ndim=2),
+                            out: qd.types.ndarray(ndim=1)):
+    for i in range(points.shape[0]):
+        out[i] = xuvdb_sample_quadratic(
+            keys, values, n_leaves, leaf_log2, background, o_x, o_y, o_z, s_x, s_y, s_z,
+            points[i, 0], points[i, 1], points[i, 2])
+
+
+@qd.kernel
+def kernel_reduce(mask: qd.types.ndarray(ndim=2),  # (n_leaves, dim^3/32) u32 active bits, z-fastest
+                  values: qd.types.ndarray(ndim=1),
+                  per_leaf: qd.types.ndarray(ndim=2),  # (n_leaves, 4) f64: sum, min, max, count
+                  words: qd.template(),
+                  dim3: qd.template()):
+    """Per-leaf reduction over ACTIVE voxels (host combines the partials)."""
+    for leaf_idx in range(mask.shape[0]):
+        s = qd.f64(0.0)
+        mn = qd.f64(1e30)
+        mx = qd.f64(-1e30)
+        c = 0
+        base = qd.i64(leaf_idx) * dim3
+        for w in range(words):
+            word = mask[leaf_idx, w]
+            if word != 0:
+                for b in range(32):
+                    if (word >> b) & 1:
+                        v = qd.f64(values[base + w * 32 + b])
+                        s += v
+                        mn = qd.min(mn, v)
+                        mx = qd.max(mx, v)
+                        c += 1
+        per_leaf[leaf_idx, 0] = s
+        per_leaf[leaf_idx, 1] = mn
+        per_leaf[leaf_idx, 2] = mx
+        per_leaf[leaf_idx, 3] = qd.f64(c)
+

@@ -37,8 +37,11 @@ class GpuVolume:
             raise ValueError("leaf keys out of range or duplicated")
         per_leaf = grid.leaf_dim**3
         values = np.empty(len(leaves) * per_leaf, dtype=np.float32)
+        self.mask = np.empty((len(leaves), per_leaf // 32), dtype=np.uint32)
         for i, leaf in enumerate(leaves):
             values[i * per_leaf:(i + 1) * per_leaf] = leaf.values.ravel()  # z-fastest C order
+            bits = np.packbits(leaf.active.reshape(-1), bitorder="little")  # bit n = voxel n
+            self.mask[i] = bits.view(np.uint32)
         self.keys = keys
         self.values = values
         self.background = float(grid.background)
@@ -46,16 +49,27 @@ class GpuVolume:
 
     # ------------------------------------------------------------------ queries
 
-    def sample(self, points, linear=False):
-        """Sample the packed volume at world-space points (N,3)."""
+    def sample(self, points, linear=False, order=None):
+        """Sample the packed volume at world-space points (N,3).
+
+        `order`: 0 = nearest, 1 = trilinear, 2 = triquadratic (3x3x3 quadratic B-spline); when
+        given it overrides the boolean `linear` flag. Order 2 matches the host
+        `VdbGrid.sample_quadratic` and does not reproduce voxel-center values (B-spline nature).
+        """
         points = np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 3)
         out = np.empty(len(points), dtype=np.float32)
-        kernel = kernels.kernel_sample_linear if linear else kernels.kernel_sample_nearest
-        kernel(
-            self.keys, self.values, int(self.grid.n_leaves), int(self.grid.leaf_log2), float(self.background),
-            *(float(v) for v in self.grid.origin_world), *(float(v) for v in self.grid.voxel_size),
-            points, out,
-        )
+        if order is None:
+            order = 1 if linear else 0
+        transform = (int(self.grid.n_leaves), int(self.grid.leaf_log2), float(self.background),
+                     *(float(v) for v in self.grid.origin_world), *(float(v) for v in self.grid.voxel_size))
+        if order == 0:
+            kernels.kernel_sample_nearest(self.keys, self.values, *transform, points, out)
+        elif order == 1:
+            kernels.kernel_sample_linear(self.keys, self.values, *transform, points, out)
+        elif order == 2:
+            kernels.kernel_sample_quadratic(self.keys, self.values, *transform, points, out)
+        else:
+            raise ValueError("order must be 0 (nearest), 1 (linear) or 2 (quadratic)")
         return out
 
     def sdf_normal(self, points):
@@ -122,6 +136,29 @@ class GpuVolume:
                 results.append((float(out[r, 1]), out[r, 2:5].copy(), float(out[r, 5])))
         return results[0] if single else results
 
+    # ------------------------------------------------------------------ reduction
+
+    def reduce(self):
+        """`{'sum', 'min', 'max', 'count'}` over ACTIVE voxels, one kernel launch.
+
+        The active mask is packed at pack time (`GpuVolume.mask`) and, like the values, frozen
+        for the volume's lifetime - re-pack after structural edits.
+        """
+        per_leaf = np.zeros((len(self.keys), 4), dtype=np.float64)
+        kernels.kernel_reduce(
+            self.mask, self.values, per_leaf,
+            words=int(self.mask.shape[1]), dim3=int(self.grid.leaf_dim**3),
+        )
+        valid = per_leaf[:, 3] > 0
+        if not valid.any():
+            return {"sum": 0.0, "min": None, "max": None, "count": 0}
+        return {
+            "sum": float(per_leaf[valid, 0].sum()),
+            "min": float(per_leaf[valid, 1].min()),
+            "max": float(per_leaf[valid, 2].max()),
+            "count": int(per_leaf[valid, 3].sum()),
+        }
+
     # ------------------------------------------------------------------ mutation
 
     def write_voxels(self, points, new_values):
@@ -145,5 +182,6 @@ class GpuVolume:
             leaf.values[...] = self.values[i * per_leaf:(i + 1) * per_leaf].reshape(
                 self.grid.leaf_dim, self.grid.leaf_dim, self.grid.leaf_dim
             )
+            leaf.invalidate()  # kernel writes changed values: derived stats are stale
         self._dirty = False
         return self.grid

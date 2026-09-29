@@ -25,18 +25,19 @@ GRID_CLASSES = ("unknown", "level set", "fog volume", "staggered")
 class Leaf:
     """One dense `dim^3` block of voxels with a per-voxel active mask.
 
-    `active_bbox()` caches the local-coordinate bounding box of active voxels; every write to
-    `active` must reset the cache (`leaf._bbox = None`) - the mutation sites are all in
-    `tree.py`/`io.py` and greppable by `leaf.active[`.
+    `active_bbox()` and `value_range()` cache per-leaf derived state; every write to `active` (or
+    to values that feed the stats) must call `leaf.invalidate()` - the mutation sites are all in
+    `tree.py`/`io.py`, greppable by `leaf.invalidate()`.
     """
 
-    __slots__ = ("origin", "values", "active", "_bbox")
+    __slots__ = ("origin", "values", "active", "_bbox", "_minmax")
 
     def __init__(self, origin, dim, value_shape, background):
         self.origin = np.asarray(origin, dtype=np.int64).reshape(3)
         self.values = np.full((dim, dim, dim) + value_shape, background, dtype=np.float32)
         self.active = np.zeros((dim, dim, dim), dtype=bool)
         self._bbox = None
+        self._minmax = None
 
     @property
     def dim(self):
@@ -45,6 +46,11 @@ class Leaf:
     @property
     def n_active(self):
         return int(self.active.sum())
+
+    def invalidate(self):
+        """Drop cached derived state (active bbox, value range); call after any mask edit."""
+        self._bbox = None
+        self._minmax = None
 
     def active_bbox(self):
         """`(lo, hi)` local bounds of active voxels (both `None` when the leaf is empty), cached."""
@@ -56,6 +62,16 @@ class Leaf:
                 self._bbox = (np.array([xs.min(), ys.min(), zs.min()], dtype=np.int64),
                               np.array([xs.max(), ys.max(), zs.max()], dtype=np.int64))
         return self._bbox
+
+    def value_range(self):
+        """`(vmin, vmax)` over active voxels (scalar grids), or `None` when the leaf is empty."""
+        if self._minmax is None:
+            picked = self.values[self.active]
+            if picked.size == 0:
+                self._minmax = (None, None)
+            else:
+                self._minmax = (float(picked.min()), float(picked.max()))
+        return self._minmax
 
 
 class VdbGrid:
@@ -195,6 +211,22 @@ class VdbGrid:
             return None
         return lo, hi
 
+    def value_range(self):
+        """`(vmin, vmax)` over active voxels of a scalar grid, or None when no active voxels.
+
+        Cached per leaf (see `Leaf.value_range`); O(n_leaves) to combine after the first call.
+        """
+        if self.is_vec:
+            raise TypeError("value_range is defined on scalar grids only")
+        lo = hi = None
+        for leaf in self._leaves.values():
+            lmin, lmax = leaf.value_range()
+            if lmin is None:
+                continue
+            lo = lmin if lo is None else min(lo, lmin)
+            hi = lmax if hi is None else max(hi, lmax)
+        return None if lo is None else (lo, hi)
+
     def copy(self):
         grid = VdbGrid(
             dtype=self.dtype,
@@ -232,7 +264,7 @@ class VdbGrid:
         local = (int(ijk[0]) - leaf.origin[0], int(ijk[1]) - leaf.origin[1], int(ijk[2]) - leaf.origin[2])
         leaf.values[local] = value
         leaf.active[local] = bool(active)
-        leaf._bbox = None
+        leaf.invalidate()
 
     def get_value(self, ijk):
         """Value at a voxel index; the background outside allocated leaves."""
@@ -274,7 +306,7 @@ class VdbGrid:
                                                   np.asarray(ijk_max, dtype=np.int64)):
             leaf.values[sl] = value
             leaf.active[sl] = bool(active)
-            leaf._bbox = None
+            leaf.invalidate()
 
     def stamp_sphere(self, center, radius, value=None, band=3.0):
         """Stamp an analytic sphere (world-space `center`).
@@ -303,7 +335,7 @@ class VdbGrid:
             else:
                 leaf.values[sl] = value
                 leaf.active[sl] = dist <= r_world
-            leaf._bbox = None
+            leaf.invalidate()
 
     def scatter_particles(self, points, h=None, weights=None, kernel="cubic"):
         """Splat particles onto the grid as a fog/density volume (additive SPH-style rasterization).
@@ -364,7 +396,7 @@ class VdbGrid:
                 else:
                     leaf.values[sl] += w * float(weights[i])
                 leaf.active[sl] |= touched
-                leaf._bbox = None
+                leaf.invalidate()
         return self
 
     def union_spheres(self, centers, radius, band=3.0):
@@ -398,7 +430,7 @@ class VdbGrid:
                 sdf = dist - r_world
                 leaf.values[sl] = np.minimum(leaf.values[sl], sdf.astype(np.float32))
                 leaf.active[sl] |= np.abs(sdf) <= band_world
-                leaf._bbox = None
+                leaf.invalidate()
         return self
 
     def csg(self, other, op):
@@ -428,7 +460,7 @@ class VdbGrid:
             else:
                 mine.values[...] = np.maximum(mine.values, theirs.values)
                 mine.active[...] &= theirs.active
-            mine._bbox = None
+            mine.invalidate()
         return self
 
     def prune(self):
@@ -510,7 +542,7 @@ class VdbGrid:
                     dst = tuple(slice(int(data_lo[a] - block_lo[a]), int(data_hi[a] - block_lo[a])) for a in range(3))
                     leaf.values[dst] = values[src]
                     leaf.active[dst] = active_mask[src]
-                    leaf._bbox = None
+                    leaf.invalidate()
         return grid
 
     # ------------------------------------------------------------------ transforms & sampling
@@ -529,6 +561,81 @@ class VdbGrid:
     def sample_linear(self, xyz):
         """Host-side trilinear sample at world coordinates (background outside data)."""
         return _sample_linear(self, np.atleast_2d(np.asarray(xyz, dtype=np.float64)))[0]
+
+    def sample_quadratic(self, xyz):
+        """Host-side triquadratic (3x3x3 quadratic B-spline) sample at world coordinates.
+
+        Weights per axis at fractional offset `u`: `[0.5(1-u)^2, 0.5 + u - u^2, 0.5 u^2]` over
+        taps `floor(x)-1 .. floor(x)+1` - the standard C1-continuous quadratic B-spline, matching
+        OpenVDB's `QuadraticSampler`. Unlike nearest/linear it does NOT reproduce the exact value
+        at voxel centers (half weight on the neighbors there); the payoff is second-order
+        smoothness for shading/collision queries. Scalar grids only. A 1-D input returns a scalar.
+        """
+        return _sample_quadratic(self, np.atleast_2d(np.asarray(xyz, dtype=np.float64)))[0]
+
+    def sample_gradient(self, xyz, order=1):
+        """Central-difference gradient `(n, 3)` at world points; `order` picks the sampler."""
+        pts = np.atleast_2d(np.asarray(xyz, dtype=np.float64))
+        sampler = _sample_linear if order == 1 else _sample_quadratic
+        sx, sy, sz = self.voxel_size
+        gx = sampler(self, pts + [sx, 0, 0]) - sampler(self, pts - [sx, 0, 0])
+        gy = sampler(self, pts + [0, sy, 0]) - sampler(self, pts - [0, sy, 0])
+        gz = sampler(self, pts + [0, 0, sz]) - sampler(self, pts - [0, 0, sz])
+        return np.stack([gx / (2.0 * sx), gy / (2.0 * sy), gz / (2.0 * sz)], axis=1).astype(np.float64)
+
+    _STENCIL7 = ((0, 0, 0), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+    _STENCIL19_EDGES = ((1, 1, 0), (1, -1, 0), (-1, 1, 0), (-1, -1, 0),
+                        (1, 0, 1), (1, 0, -1), (-1, 0, 1), (-1, 0, -1),
+                        (0, 1, 1), (0, 1, -1), (0, -1, 1), (0, -1, -1))
+
+    def stencil7_batch(self, indices):
+        """7-point stencil values `(n, 7)` at voxel indices, order [c, +x, -x, +y, -y, +z, -z]."""
+        idxs = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
+        offsets = np.asarray(self._STENCIL7, dtype=np.int64)
+        vals, _ = self.probe_batch((idxs[:, None, :] + offsets[None, :, :]).reshape(-1, 3))
+        return np.asarray(vals).reshape(len(idxs), 7)
+
+    def stencil19_batch(self, indices):
+        """19-point stencil `(n, 19)`: the 7-point pattern + the 12 edge neighbors (second half).
+
+        Enough for second derivatives with cross terms (e.g. Hessian diagonals via
+        `(f(+e_i) + f(-e_i) - 2 f(c)) / h^2` and mixed terms via edge pairs).
+        """
+        idxs = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
+        offsets = np.asarray(self._STENCIL7 + self._STENCIL19_EDGES, dtype=np.int64)
+        vals, _ = self.probe_batch((idxs[:, None, :] + offsets[None, :, :]).reshape(-1, 3))
+        return np.asarray(vals).reshape(len(idxs), 19)
+
+
+def _quad_weight(u, j):
+    """Quadratic B-spline tap weight at fractional offset `u` for tap `j` in {0, 1, 2}."""
+    if j == 0:
+        return 0.5 * (1.0 - u) ** 2
+    if j == 1:
+        return 0.5 + u - u * u
+    return 0.5 * u * u
+
+
+def _sample_quadratic(grid, points_world):
+    """Vectorized triquadratic sampling of a scalar grid; one result per row of `points_world`."""
+    coords = (points_world - grid.origin_world) / grid.voxel_size
+    base = np.floor(coords).astype(np.int64)
+    frac = coords - base
+    n = len(points_world)
+    # gather all 27 taps for all points in ONE probe_batch call
+    taps = np.stack([base + np.array([j - 1, k - 1, l - 1])
+                     for j in range(3) for k in range(3) for l in range(3)])  # (27, n, 3)
+    vals, _ = grid.probe_batch(taps.reshape(-1, 3))
+    vals = np.asarray(vals, dtype=np.float64).reshape(3, 3, 3, n)
+    out = np.zeros(n, dtype=grid._numpy_value_dtype())
+    for j in range(3):
+        wj = _quad_weight(frac[:, 0], j)
+        for k in range(3):
+            wk = _quad_weight(frac[:, 1], k)
+            for l in range(3):
+                wl = _quad_weight(frac[:, 2], l)
+                out += (wj * wk * wl * vals[j, k, l]).astype(out.dtype)
+    return out
 
 
 def _slice_world_distance(leaf, sl, voxel_size, origin_world, center):

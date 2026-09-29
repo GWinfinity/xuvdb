@@ -17,14 +17,18 @@ OpenVDB 流"。
 **7.0 us/射线**,宿主标量 DDA 2.4-3.3 ms/射线(约 350-470 倍);宿主 bbox 跳跃在密集
 窄带网格上收益中性,内核批量路径是推荐入口。
 
-## v0.3 — 采样与统计
+## v0.3 — 采样与统计 ✅ 0.3.0
 
-- [ ] Triquadratic(三次)采样器(宿主 + 内核);
-- [ ] 宿主侧梯度 / stencil API(7/19 点差分模板);
-- [ ] 每叶 min/max 统计缓存(带宽门控、快速极值查询);
-- [ ] GPU map-reduce 原语(active 求和/极值/计数)。
+- [x] Triquadratic(三次)采样器(宿主 + 内核):3x3x3 二次 B 样条,权重
+  `[0.5(1-u)^2, 0.5+u-u^2, 0.5u^2]`,与 OpenVDB `QuadraticSampler` 同式;
+- [x] 宿主侧 `sample_gradient`(中心差分,order=1/2)+ `stencil7_batch` / `stencil19_batch`;
+- [x] 每叶 min/max 统计缓存(`Leaf.value_range` / `VdbGrid.value_range`,
+  与 bbox 共用 `invalidate()` 失效点);
+- [x] GPU map-reduce:`GpuVolume.reduce()`(active 求和/极值/计数,一次 launch,
+  掩码按 u32 打包进 packed volume)。
 
-验收:三次采样与 OpenVDB 参考实现数值对齐;统计缓存与暴力计算一致。
+验收:三次采样与稠密独立参考实现逐点对齐(atol 1e-5)、内核-宿主奇偶(atol 2e-5)、
+常量场复现、球面梯度径向;统计与暴力计算一致;CPU/CUDA/Vulkan 三后端冒烟通过。
 
 ## v0.4 — 生态互通
 

@@ -169,6 +169,6 @@ def load(path):
             else:
                 leaf.values[...] = values_flat.reshape(dim, dim, dim)
             leaf.active[...] = active.reshape(dim, dim, dim)
-            leaf._bbox = None
+            leaf.invalidate()
         grids.append(grid)
     return grids
