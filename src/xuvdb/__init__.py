@@ -1,4 +1,4 @@
-"""XUVDB（太虚）: genesis' own sparse-volume format, built on the quadrants kernel.
+"""XUVDB（太虚）: a sparse-volume format built on the quadrants kernel.
 
 The name reads 太虚 (tàixū) - from《庄子·知北游》「不游乎太虚」and 张载《正蒙》「太虚无形，
 气之本体」: the closest Chinese rendering of an unbounded, sparse index domain - unbounded (the
