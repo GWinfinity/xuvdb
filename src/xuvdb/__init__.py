@@ -47,7 +47,7 @@ from .ray import ray_surface_hit
 from .runtime import init_runtime
 from .tree import Leaf, VdbGrid
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "GpuVolume",

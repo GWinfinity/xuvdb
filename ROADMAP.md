@@ -5,13 +5,17 @@ attention/可微训练是 fvdb-core 的领地),下不做邻居搜索(求解器�
 独有的生态位:零 C++ 构建即得"宿主端任意结构编辑 + 内核端可写值 + 纯 Python 读写
 OpenVDB 流"。
 
-## v0.2 — 遍历与加速
+## v0.2 — 遍历与加速 ✅ 0.2.0
 
-- [ ] 叶级 active bbox 缓存:`stamp/csg/fill/prune/load` 时失效重算;
-- [ ] 内核端 DDA:`ray.py` 的块跳逻辑移植为 quadrants kernel,可用 GPU 后端;
-- [ ] `iter_voxels` / 批量索引查询向量化,消除逐体素 Python 循环。
+- [x] 叶级 active bbox 缓存:`stamp/csg/fill/prune/load` 时失效重算;
+- [x] 内核端 DDA:`ray.py` 的块跳逻辑移植为 quadrants kernel(`GpuVolume.ray_surface_hit`,
+  批量射线一次 launch),CPU / CUDA / Vulkan 后端验证通过;
+- [x] `active_indices` / `active_values` / `probe_batch` 向量化查询,`_sample_linear`
+  小批量走 `get_value`、大批量走 `probe_batch`。
 
-验收:射线基准对宿主实现加速比明确;`pytest` 全绿;GPU 后端冒烟通过。
+实测(GTX 1650,300 粒子 union_spheres 网格,1000 射线):内核批量 DDA 在 CUDA 上
+**7.0 us/射线**,宿主标量 DDA 2.4-3.3 ms/射线(约 350-470 倍);宿主 bbox 跳跃在密集
+窄带网格上收益中性,内核批量路径是推荐入口。
 
 ## v0.3 — 采样与统计
 

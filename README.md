@@ -79,6 +79,8 @@ surf.union_spheres(drops, radius=0.03)                    # particle level set �
 
 # 6) DDA 射线（空叶块按块跳过，交叉点二分细化到亚体素）
 t, point, value = xuvdb.ray_surface_hit(grid, (0.3, 0.2, 2.0), (0, 0, -1))
+# 内核端批量射线（一次 launch 跑全部射线，CPU/CUDA/Vulkan 可用）：
+hits = vol.ray_surface_hit(origins, dirs)   # vol = xuvdb.GpuVolume(grid)，逐射线 (t, point, value) 或 None
 ```
 
 稠密场 ⇄ 稀疏网格：

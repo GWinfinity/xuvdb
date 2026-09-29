@@ -69,6 +69,59 @@ class GpuVolume:
         )
         return out
 
+    # ------------------------------------------------------------------ rays
+
+    def ray_surface_hit(self, origin, direction, tmax=None, isovalue=0.0, refine_steps=24,
+                        max_steps=1 << 20):
+        """Kernel-side DDA hit of `isovalue`: `(t, point(3,), value)` or None per ray.
+
+        One kernel launch carries every ray (the marches run in parallel), so passing all rays at
+        once (`(n, 3)` origin/direction arrays, returns a list) amortizes the launch cost that a
+        per-ray call pays every time. Mirrors `ray.ray_surface_hit` (same block skips and cached
+        active-bbox culling). Only float32 scalar grids (the `GpuVolume` constraint) are supported.
+        """
+        single = np.asarray(origin).ndim == 1
+        origins = np.ascontiguousarray(origin, dtype=np.float64).reshape(-1, 3)
+        dirs = np.ascontiguousarray(direction, dtype=np.float64).reshape(-1, 3)
+        if len(origins) != len(dirs):
+            raise ValueError("origin and direction must have the same ray count")
+        norms = np.linalg.norm(dirs, axis=1, keepdims=True)
+        if np.any(norms == 0.0):
+            raise ValueError("direction must be nonzero")
+        dirs = dirs / norms
+        if tmax is None:
+            bbox = self.grid.bbox()
+            if bbox is None:
+                tmax = 1e30
+            else:
+                far = self.grid.index_to_world(bbox[1])
+                # conservative per-ray default: the largest single-ray bound across the batch
+                tmax = float(np.max(2.0 * np.linalg.norm(far[None, :] - origins, axis=1) + 1.0))
+
+        n = len(self.keys)
+        bbox_lo = np.full((n, 3), 1, dtype=np.int32)
+        bbox_hi = np.full((n, 3), 0, dtype=np.int32)  # lo > hi marks a leaf with no active voxels
+        for i, leaf in enumerate(self.grid.leaves()):
+            llo, lhi = leaf.active_bbox()
+            if llo is not None:
+                bbox_lo[i] = llo
+                bbox_hi[i] = lhi
+        out = np.zeros((len(origins), 6), dtype=np.float64)
+        kernels.kernel_ray_surface_hit(
+            self.keys, self.values, int(self.grid.n_leaves), int(self.grid.leaf_log2), float(self.background),
+            bbox_lo, bbox_hi,
+            *(float(v) for v in self.grid.origin_world), *(float(v) for v in self.grid.voxel_size),
+            origins, dirs, float(tmax), float(isovalue), out,
+            refine_steps=refine_steps, max_steps=max_steps,
+        )
+        results = []
+        for r in range(len(origins)):
+            if out[r, 0] == 0.0:
+                results.append(None)
+            else:
+                results.append((float(out[r, 1]), out[r, 2:5].copy(), float(out[r, 5])))
+        return results[0] if single else results
+
     # ------------------------------------------------------------------ mutation
 
     def write_voxels(self, points, new_values):

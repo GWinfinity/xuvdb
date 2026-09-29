@@ -23,14 +23,20 @@ GRID_CLASSES = ("unknown", "level set", "fog volume", "staggered")
 
 
 class Leaf:
-    """One dense `dim^3` block of voxels with a per-voxel active mask."""
+    """One dense `dim^3` block of voxels with a per-voxel active mask.
 
-    __slots__ = ("origin", "values", "active")
+    `active_bbox()` caches the local-coordinate bounding box of active voxels; every write to
+    `active` must reset the cache (`leaf._bbox = None`) - the mutation sites are all in
+    `tree.py`/`io.py` and greppable by `leaf.active[`.
+    """
+
+    __slots__ = ("origin", "values", "active", "_bbox")
 
     def __init__(self, origin, dim, value_shape, background):
         self.origin = np.asarray(origin, dtype=np.int64).reshape(3)
         self.values = np.full((dim, dim, dim) + value_shape, background, dtype=np.float32)
         self.active = np.zeros((dim, dim, dim), dtype=bool)
+        self._bbox = None
 
     @property
     def dim(self):
@@ -39,6 +45,17 @@ class Leaf:
     @property
     def n_active(self):
         return int(self.active.sum())
+
+    def active_bbox(self):
+        """`(lo, hi)` local bounds of active voxels (both `None` when the leaf is empty), cached."""
+        if self._bbox is None:
+            xs, ys, zs = np.nonzero(self.active)
+            if xs.size == 0:
+                self._bbox = (None, None)
+            else:
+                self._bbox = (np.array([xs.min(), ys.min(), zs.min()], dtype=np.int64),
+                              np.array([xs.max(), ys.max(), zs.max()], dtype=np.int64))
+        return self._bbox
 
 
 class VdbGrid:
@@ -125,15 +142,53 @@ class VdbGrid:
             for x, y, z in zip(xs, ys, zs):
                 yield (int(ox + x), int(oy + y), int(oz + z)), leaf.values[x, y, z]
 
+    def active_indices(self):
+        """`(n, 3)` int64 array of every active voxel's index, leaf-order (vectorized per leaf)."""
+        chunks = []
+        for leaf in self.leaves():
+            xs, ys, zs = np.nonzero(leaf.active)
+            chunks.append(np.stack([leaf.origin[0] + xs, leaf.origin[1] + ys, leaf.origin[2] + zs], axis=1))
+        if not chunks:
+            return np.zeros((0, 3), dtype=np.int64)
+        return np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
+
+    def active_values(self):
+        """`(n,)` / `(n, 3)` array of every active voxel's value, matching `active_indices` order."""
+        chunks = [leaf.values[leaf.active] for leaf in self.leaves()]
+        if not chunks:
+            return np.zeros((0,) + self.value_shape, dtype=self._numpy_value_dtype())
+        return np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
+
+    def probe_batch(self, indices):
+        """Vectorized probe for an `(n, 3)` index array: `((n,)[, 3])` values + `(n,)` active flags.
+
+        Unallocated voxels read as `(background, False)`; the per-leaf gather is vectorized, only
+        the grouping by leaf key is a Python loop.
+        """
+        idxs = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
+        vals = np.full((len(idxs),) + self.value_shape, self.background, dtype=self._numpy_value_dtype())
+        act = np.zeros(len(idxs), dtype=bool)
+        rows_by_key = {}
+        for r, key in enumerate(map(tuple, idxs >> self.leaf_log2)):
+            rows_by_key.setdefault(key, []).append(r)
+        for key, rows in rows_by_key.items():
+            leaf = self._leaves.get(key)
+            if leaf is None:
+                continue
+            rows = np.asarray(rows, dtype=np.int64)
+            local = idxs[rows] - leaf.origin
+            vals[rows] = leaf.values[local[:, 0], local[:, 1], local[:, 2]]
+            act[rows] = leaf.active[local[:, 0], local[:, 1], local[:, 2]]
+        return vals, act
+
     def bbox(self):
         """Index-space integer (min, max) bounding box of active voxels, or None if empty."""
         lo = hi = None
         for leaf in self._leaves.values():
-            xs, ys, zs = np.nonzero(leaf.active)
-            if xs.size == 0:
+            llo, lhi = leaf.active_bbox()
+            if llo is None:
                 continue
-            leaf_lo = leaf.origin + np.array([xs.min(), ys.min(), zs.min()])
-            leaf_hi = leaf.origin + np.array([xs.max(), ys.max(), zs.max()])
+            leaf_lo, leaf_hi = leaf.origin + llo, leaf.origin + lhi
             lo = leaf_lo if lo is None else np.minimum(lo, leaf_lo)
             hi = leaf_hi if hi is None else np.maximum(hi, leaf_hi)
         if lo is None:
@@ -177,6 +232,7 @@ class VdbGrid:
         local = (int(ijk[0]) - leaf.origin[0], int(ijk[1]) - leaf.origin[1], int(ijk[2]) - leaf.origin[2])
         leaf.values[local] = value
         leaf.active[local] = bool(active)
+        leaf._bbox = None
 
     def get_value(self, ijk):
         """Value at a voxel index; the background outside allocated leaves."""
@@ -218,6 +274,7 @@ class VdbGrid:
                                                   np.asarray(ijk_max, dtype=np.int64)):
             leaf.values[sl] = value
             leaf.active[sl] = bool(active)
+            leaf._bbox = None
 
     def stamp_sphere(self, center, radius, value=None, band=3.0):
         """Stamp an analytic sphere (world-space `center`).
@@ -246,6 +303,7 @@ class VdbGrid:
             else:
                 leaf.values[sl] = value
                 leaf.active[sl] = dist <= r_world
+            leaf._bbox = None
 
     def scatter_particles(self, points, h=None, weights=None, kernel="cubic"):
         """Splat particles onto the grid as a fog/density volume (additive SPH-style rasterization).
@@ -306,6 +364,7 @@ class VdbGrid:
                 else:
                     leaf.values[sl] += w * float(weights[i])
                 leaf.active[sl] |= touched
+                leaf._bbox = None
         return self
 
     def union_spheres(self, centers, radius, band=3.0):
@@ -339,6 +398,7 @@ class VdbGrid:
                 sdf = dist - r_world
                 leaf.values[sl] = np.minimum(leaf.values[sl], sdf.astype(np.float32))
                 leaf.active[sl] |= np.abs(sdf) <= band_world
+                leaf._bbox = None
         return self
 
     def csg(self, other, op):
@@ -368,6 +428,7 @@ class VdbGrid:
             else:
                 mine.values[...] = np.maximum(mine.values, theirs.values)
                 mine.active[...] &= theirs.active
+            mine._bbox = None
         return self
 
     def prune(self):
@@ -449,6 +510,7 @@ class VdbGrid:
                     dst = tuple(slice(int(data_lo[a] - block_lo[a]), int(data_hi[a] - block_lo[a])) for a in range(3))
                     leaf.values[dst] = values[src]
                     leaf.active[dst] = active_mask[src]
+                    leaf._bbox = None
         return grid
 
     # ------------------------------------------------------------------ transforms & sampling
@@ -478,6 +540,7 @@ def _slice_world_distance(leaf, sl, voxel_size, origin_world, center):
 
 def _sample_linear(grid, points_world):
     """Vectorized trilinear sampling of a scalar grid; one result per row of `points_world`."""
+    points_world = np.atleast_2d(np.asarray(points_world, dtype=np.float64))
     coords = (points_world - grid.origin_world) / grid.voxel_size
     base = np.floor(coords).astype(np.int64)
     frac = coords - base
@@ -489,6 +552,10 @@ def _sample_linear(grid, points_world):
                 w = ((frac[:, 0] if dx else 1.0 - frac[:, 0])
                      * (frac[:, 1] if dy else 1.0 - frac[:, 1])
                      * (frac[:, 2] if dz else 1.0 - frac[:, 2]))
-                vals = np.array([grid.get_value((int(i[0]), int(i[1]), int(i[2]))) for i in ijk], dtype=np.float64)
-                out += (vals * w).astype(out.dtype)
+                if len(points_world) >= 32:
+                    vals, _ = grid.probe_batch(ijk)  # vectorized gather pays off on batches
+                else:
+                    vals = np.array([grid.get_value((int(i[0]), int(i[1]), int(i[2]))) for i in ijk],
+                                    dtype=np.float64)
+                out += (np.asarray(vals, dtype=np.float64).reshape(-1) * w).astype(out.dtype)
     return out
