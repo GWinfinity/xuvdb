@@ -228,7 +228,7 @@ def write_vdb(path, grids, blosc=False):
         s.i64(0)
         s.i64(0)
         grid_pos = s.tell()
-        block_pos = _write_grid_stream(s, grid, blosc=blosc)
+        block_pos = _write_grid_stream(s, grid, use_blosc=blosc)
         end_pos = s.tell()
         s.patch_i64(offset_pos, grid_pos)
         s.patch_i64(offset_pos + 8, block_pos)
@@ -239,9 +239,9 @@ def write_vdb(path, grids, blosc=False):
     return len(s.buf)
 
 
-def _write_grid_stream(s, grid, blosc=False):
+def _write_grid_stream(s, grid, use_blosc=False):
     """Emit one grid's metadata, transform, topology and buffers; returns the block (buffers) offset."""
-    s.u32(COMPRESS_ACTIVE_MASK | (COMPRESS_BLOSC if blosc else 0))
+    s.u32(COMPRESS_ACTIVE_MASK | (COMPRESS_BLOSC if use_blosc else 0))
 
     bbox = grid.bbox()
     meta = [("name", "string", grid.name.encode("utf-8")),
@@ -305,12 +305,12 @@ def _write_grid_stream(s, grid, blosc=False):
         for int4 in int5["children"]:
             for leaf in int4["children"]:
                 s.raw(_pack_mask(leaf["active"]).astype("<u8").tobytes())
-                _write_compressed_values(s, leaf["values"], leaf["active"], grid, blosc)
+                _write_compressed_values(s, leaf["values"], leaf["active"], grid, use_blosc)
 
     return block_pos
 
 
-def _write_compressed_values(s, values, active, grid, blosc=False):
+def _write_compressed_values(s, values, active, grid, use_blosc=False):
     """One leaf value block under COMPRESS_ACTIVE_MASK: metadata 0 (or 2/5/6) + active values."""
     flat = values.reshape(-1) if not grid.is_vec else values.reshape(-1, 3)
     inactive = flat[~active.reshape(-1)]
@@ -342,14 +342,14 @@ def _write_compressed_values(s, values, active, grid, blosc=False):
         selection = (flat == distinct[1]).all(axis=-1) if grid.is_vec else (flat == distinct[1])
         s.raw(_pack_mask(selection & ~active.reshape(-1)).astype("<u8").tobytes())
     payload = (flat if metadata == _NO_MASK_AND_ALL_VALS else flat[active.reshape(-1)]).astype(wire_dtype)
-    _emit_value_payload(s, np.ascontiguousarray(payload).tobytes(), blosc)
+    _emit_value_payload(s, np.ascontiguousarray(payload).tobytes(), use_blosc)
 
 
-def _emit_value_payload(s, payload, blosc):
+def _emit_value_payload(s, payload, use_blosc):
     """The leaf's value buffer with bloscToStream semantics: i64 length (positive = Blosc frame,
     negative = -raw size) then the bytes; falls back to raw when compression does not shrink.
     Frame parameters mirror OpenVDB's bloscCompress (clevel 9, byte shuffle)."""
-    if not blosc:
+    if not use_blosc:
         s.raw(payload)
         return
     if blosc is None:
@@ -676,7 +676,10 @@ def _read_compressed_values(s, count, value_mask, value_dtype, components, backg
     mask_compressed = compression & COMPRESS_ACTIVE_MASK
     temp_count = int(value_mask.sum()) if (mask_compressed and metadata != _NO_MASK_AND_ALL_VALS) else count
 
-    blob = _read_data_blob(s, temp_count * item, compression)
+    if temp_count == 0:
+        blob = b""  # empty value tables (no active tiles) carry no data block at all
+    else:
+        blob = _read_data_blob(s, temp_count * item, compression)
     values = np.frombuffer(blob, dtype=wire).astype(np.float64)
     if components == 3:
         values = values.reshape(temp_count, 3)

@@ -143,6 +143,26 @@ def test_rotated_grid_io_roundtrip(tmp_path):
         assert np.allclose(sample_grid(grid, pts), sample_grid(back, pts), atol=1e-5)
 
 
+def test_blosc_vdb_roundtrip(tmp_path):
+    grid = make_grid()
+    path = str(tmp_path / "b.vdb")
+    xuvdb.write_vdb(path, [grid], blosc=True)
+    back = xuvdb.read_vdb(path, grid_name="shield")[0]
+    # narrow-band fidelity (the .vdb active-mask contract: inactive-only sub-leaves fold to bg)
+    sdf_union = lambda p: min(np.linalg.norm(p - np.array([0.3, 0.2, 0.1])) - 0.25,
+                              np.linalg.norm(p - np.array([0.5, 0.2, 0.1])) - 0.10)
+    pts = PTS[np.abs([sdf_union(p) for p in PTS]) <= 0.10][:64]
+    v0 = sample_grid(grid, pts)
+    v1 = sample_grid(back, pts)
+    assert np.allclose(v0, v1, atol=1e-5)
+    # blosc read-back is bit-identical to the plain read-back
+    plain = str(tmp_path / "p.vdb")
+    xuvdb.write_vdb(plain, [grid])
+    pback = xuvdb.read_vdb(plain)[0]
+    for lb, lp in zip(back.leaves(), pback.leaves()):
+        assert np.array_equal(lb.values, lp.values) and np.array_equal(lb.active, lp.active)
+
+
 def test_kernel_rejects_rotated_and_half():
     from xuvdb.gpu import GpuVolume
     grid = make_grid()
