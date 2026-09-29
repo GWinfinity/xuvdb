@@ -48,7 +48,7 @@ from .runtime import init_runtime
 from . import torch_bridge
 from .tree import Leaf, VdbGrid
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 __all__ = [
     "GpuVolume",

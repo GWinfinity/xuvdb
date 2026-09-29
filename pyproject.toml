@@ -10,6 +10,29 @@ dynamic = ["version"]
 requires-python = ">=3.10,<3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+authors = [{ name = "xuvdb contributors" }]
+keywords = ["sparse-volumes", "voxel", "openvdb", "nanovdb", "sdf", "physics-simulation", "quadrants"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://atomgit.com/allan_/xuvdb"
+Repository = "https://atomgit.com/allan_/xuvdb"
+Issues = "https://atomgit.com/allan_/xuvdb/issues"
+Changelog = "https://atomgit.com/allan_/xuvdb/blob/main/ROADMAP.md"
+Benchmarks = "https://atomgit.com/allan_/xuvdb/blob/main/BENCHMARKS.md"
 dependencies = [
     "numpy",
     "quadrants",

@@ -24,8 +24,12 @@
 |---|---|---|---|
 | 结构 | 5 层 B+树，CPU C++ | 同构只读缓冲，GPU | 两级：dict 叶根 + 稠密叶块 |
 | 可修改 | ✅（CPU） | ❌ GPU 只读 | ✅ Python 端任意结构编辑；**内核端可写值** |
-| 可微分包差 | ❌ | ❌ | 值缓冲可被 quadrants 内核读写（拓扑固定） |
-| Python 依赖 | pyopenvdb（需自行构建） | — | 仅 numpy + quadrants |
+| 值缓冲 GPU 可写 | ❌ | ❌ | ✅ `write_voxels` 拓扑固定就地写 |
+| 端到端可微 | ❌ | ❌ | 采样对叶值/坐标有解析梯度（`torch_bridge.sample_t`）；稀疏卷积等训练算子仍无 |
+| Python 依赖 | pyopenvdb（需自行构建） | C++ 工具链 | numpy + quadrants（quadrants 是带 JIT 的完整工具链：首次调用现场编译内核；GPU 需驱动，无 GPU 时 CPU 后端可用——射线慢 ~450 倍、采样只慢 ~4 倍，见 BENCHMARKS.md） |
+
+头条数字（300 粒子网格、CPU 后端）：内核三线性 **~39M 点/s**，内核批量射线 **~156k 射线/s**
+（宿主逐点 0.3k/s），稀疏存储相对同分辨率稠密省 ~98% 内存。完整表与复现脚本见 BENCHMARKS.md。
 
 定位不是替换任何求解器，而是补一个**可编辑的稀疏空间表示层**。
 
@@ -47,12 +51,13 @@ uv pip install -e ".[test]" # 开发模式 + pytest
 import numpy as np
 import xuvdb
 
-# 1) 编辑：窄带 level set 球（体素 0.05，带宽 3 体素）
+# 1) 编辑：窄带 level set 球（体素 0.05 世界单位；band=3 是 3 个体素；leaf_log2=4 即 16^3 叶）
+#    动词语义：SDF stamp = 与现有场取 min（并集）；fog stamp（给 value=）= 覆盖；scatter_* = 累加
 grid = xuvdb.VdbGrid(background=3 * 0.05, voxel_size=0.05, leaf_log2=4,
                      name="shield", grid_class="level set")
 grid.stamp_sphere((0.3, 0.2, 0.1), radius=0.25, band=3.0)
-grid.stamp_sphere((0.5, 0.2, 0.1), radius=0.10)          # CSG：并入第二个球
-grid.fill_box((-2, -2, -2), (2, 2, 2), value=0.0)         # 任意稠密填充（示例）
+grid.stamp_sphere((0.5, 0.2, 0.1), radius=0.10)          # min-union：并入第二个球（= csg union）
+grid.fill_box((-2, -2, -2), (2, 2, 2), 0.0)              # 任意稠密填充（示例）
 grid.prune()
 
 # 2) 自有格式落盘 / 读回（多网格、f32/f64/vec3）
@@ -71,7 +76,9 @@ q = vol.sample(pts, order=2)              # 三次采样：C1 平滑（宿主侧
 g = grid.sample_gradient(pts)             # 中心差分梯度（宿主）；stencil7/19_batch 供模板算子
 stats = vol.reduce()                      # active 求和/极值/计数（一次 kernel launch）
 n = vol.sdf_normal(pts)                   # 有限差分表面法向
-vol.write_voxels(pts, np.array([-0.01], np.float32)); vol.sync_to_host()
+vol.write_voxels(pts, np.array([-0.01], np.float32))
+vol.sync_to_host(refresh_mask=True)   # 内核写进 inactive 体素的值默认不进 write_vdb/active_*；
+                                      # refresh_mask 重算掩码使其可见（sample/.xuvdb/to_dense 不受影响）
 
 # 5) 粒子 ⇄ 体积（液体/油）
 drops = np.array([[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]])
@@ -80,7 +87,7 @@ fog.scatter_particles(drops, h=4 * 0.05, weights=1.0)     # SPH cubic 核密度 
 surf = xuvdb.VdbGrid(background=3 * 0.05, voxel_size=0.05, grid_class="level set")
 surf.union_spheres(drops, radius=0.03)                    # particle level set 表面代理
 
-# 7) torch 桥（互通不做框架：张量往返 + 可微采样；pip install 'xuvdb[torch]'）
+# 6) torch 桥（互通不做框架：张量往返 + 可微采样；pip install 'xuvdb[torch]'）
 from xuvdb.torch_bridge import grid_to_tensors, sample_t, tensors_to_grid
 t = grid_to_tensors(grid, device="cuda")            # keys/values/active -> tensors
 t["values"].requires_grad_(True)                    # 叶值张量可训练
@@ -91,11 +98,11 @@ field.sum().backward()                              # 解析梯度: dL/dvalues +
 back = tensors_to_grid(t, grid.voxel_size, grid.origin_world,
                        grid.leaf_log2, grid.background, name=grid.name)
 
-# 8) 多网格批量打包（GridBatch 式：一次 launch 采样所有网格）
+# 7) 多网格批量打包（GridBatch 式：一次 launch 采样所有网格）
 batch = xuvdb.gpu.VolumeBatch([grid_a, grid_b])     # 各自的变换/叶尺寸都可不同
 vals = batch.sample(points, volume_ids)             # (m,3) 点 + 每点所属网格 id
 
-# 6) DDA 射线（空叶块按块跳过，交叉点二分细化到亚体素）
+# 8) DDA 射线（空叶块按块跳过，交叉点二分细化到亚体素）
 t, point, value = xuvdb.ray_surface_hit(grid, (0.3, 0.2, 2.0), (0, 0, -1))
 # 内核端批量射线（一次 launch 跑全部射线，CPU/CUDA/Vulkan 可用）：
 hits = vol.ray_surface_hit(origins, dirs)   # vol = xuvdb.GpuVolume(grid)，逐射线 (t, point, value) 或 None
@@ -112,22 +119,25 @@ dense, ijk_min = sparse.to_dense()        # 反向：渲染器 / 求解器输入
 
 ## 格式
 
-### `.xuvdb`（自有格式，小端）
+### `.xuvdb`（自有格式 v2，小端）
 
 ```
-"XUVDB" | u8 version=1 | u8 flags | u16 n_grids
+"XUVDB" | u8 version=2 | u8 flags(bit0=zlib 载荷, bit1=CRC32 尾注) | u16 n_grids
+payload（bit0 时为 zlib 压缩）:
 per grid:
-  str name | u8 type(0=f32,1=f64,2=vec3f) | u8 leaf_log2 | u8 class | u8 rsv
-  f64[3] voxel_size | f64[3] origin_world | background
+  str name | u8 type(0=f32,1=f64,2=vec3f,3=f16) | u8 leaf_log2 | u8 class
+  | u8 grid_flags(bit0=后随旋转阵) | u8 rsv
+  f64[3] voxel_size | f64[3] origin_world | [f64[9] rotation] | background
   u32 n_leaves
   per leaf（按叶原点排序）: i32[3] origin | u64[dim³/64] active mask | 值稠密数组
+trailer（bit1）: u32 CRC32（对未压缩载荷计算）
 ```
 
+- v1 文件（无压缩/无尾注/无旋转）永久可读；值缓冲是**全量稠密叶**（非掩码过滤），
+  内核写进 inactive 体素的值在 save/load 后保留。
 - 叶内线性序 `n = x·dim² + y·dim + z`（z 最快），**与 OpenVDB leaf 序一致**，互转零转置。
-- 叶块与 OpenVDB LeafNode 同为稠密缓冲：level set 内部体素的 `-background` 值在
-  save/load 后保留。
-- 变换约定与 OpenVDB 线性映射一致：`world = index · voxel_size + origin_world`，
-  体素中心在整数索引处。
+- 变换：`world = R @ (index · voxel_size) + origin_world`，体素中心在整数索引处；
+  R 缺省为单位阵。
 
 ### `.vdb`（OpenVDB 官方流格式，仅显式导出用）
 
@@ -136,37 +146,52 @@ per grid:
 
 - 头 57B：`int64 magic 0x56444220`、u32 文件版本、u32 库主/次版本、u8 offsets 标志、36 字符 UUID；
 - 文件级元数据表 → i32 网格数 → **描述符与网格流交错**（描述符、i64×3 偏移、网格流、下一描述符…）；
-- 网格流：u32 压缩标志 → 元数据表（name/class/file_* 统计）→ 变换（ScaleTranslate 家族
-  = 类型字符串 + 6×Vec3d）→ 树（`i32 buffer_count`、root 背景 + tiles + 子节点）；
+- 网格流：u32 压缩标志 → 元数据表（name/class/file_* 统计）→ 变换 → 树（`i32 buffer_count`、
+  root 背景 + tiles + 子节点）；
+- 变换是**按类型字符串分发的表**（`math/Maps.h` 各 `write()` 的布局）：ScaleTranslate 家族
+  6×Vec3d、Scale/UniformScaleMap 5×Vec3d（OpenVDB 等向体素的默认产物即 UniformScaleMap）、
+  TranslationMap 1×Vec3d、Affine/UnitaryMap 一个 Mat4d，NonlinearFrustumMap 显式拒绝；
 - 树：root → InternalNode(5)（32³ 桌、512×u64 双掩码、值表）→ InternalNode(4)（64 项）→
   LeafNode(8³)（拓扑段只有值掩码，origin 由树路径隐含；缓冲段掩码重写一遍 + 值块）；
 - 值块：`io::writeCompressedValues` 语义 —— 1 字节 metadata（0=惰性值全为 +bg、1=-bg、
   2/4/5=带 1~2 个惰性值/选择掩码、6=全量数组）+ 值（按 ACTIVE_MASK 只存 active）。
 
-写侧：文件版本 224、压缩 = `COMPRESS_ACTIVE_MASK`（无 zip/blosc），任何 OpenVDB ≥ 9 可读。
-读侧：支持 `COMPRESS_NONE` / `COMPRESS_ZIP`（stdlib zlib）/ `COMPRESS_ACTIVE_MASK` /
-`_HalfFloat` 网格；Blosc 抛出明确错误；root/internode 活动 tile 物化为稠密叶
+写侧：文件版本固定 **224**——本实现不产出 half 网格与 root tile，224（`_MULTIPASS_IO`）
+的读者面最广（上游 225 起才有 half-grid 文件项）；值块压缩可选 `COMPRESS_ACTIVE_MASK`
+（默认，无 zip/blosc）或叠加 `COMPRESS_BLOSC`（`blosc=True`，需 `pip install blosc`，帧参数
+对齐 OpenVDB `bloscCompress`：clevel 9 + byte shuffle）。带旋转的网格写 AffineMap，轴对齐写
+ScaleTranslateMap；任何 OpenVDB ≥ 9 可读。
+读侧：`COMPRESS_NONE` / `COMPRESS_ZIP`（stdlib zlib）/ `COMPRESS_BLOSC`（需 blosc 包）/
+`COMPRESS_ACTIVE_MASK` / `_HalfFloat` 网格；root/internode 活动 tile 物化为稠密叶
 （受 `max_tile_voxels` 上限保护）。
 
 ## 已知边界
 
 - `GpuVolume` 只支持 f32 标量网格（f16/f64/vec3 为宿主与格式层类型）；写入只改值不改拓扑、
-  不动 active 掩码（掩码是宿主侧状态）。结构性编辑后需重新打包。
+  不动 active 掩码（掩码是宿主侧状态）。**掩码语义**：内核写进 inactive 体素的值能通过
+  `sample*`、`.xuvdb` 存取、`to_dense`、射线看到（叶是稠密缓冲），但 **`write_vdb` 与
+  `active_*`/`reduce` 按掩码过滤**——`sync_to_host(refresh_mask=True)` 可把非背景值重标为
+  active；结构性编辑后仍需重新打包。
 - 内核仅支持轴对齐网格；带 `rotation` 的网格在宿主侧全功能（采样/射线/stamp/两种格式），
   交给 `GpuVolume` 会显式报错。
 - `scatter_particles`／`union_spheres` 是 Python 循环 + 叶切片向量化：千级粒子适用，
-  大规模生产需按叶批处理（未做）。`union_spheres` 的 min-of-spheres 距离在重叠粒子间
-  的凹桥区是真实距离的上界（Lipschitz 精确），做碰撞/渲染代理足够，精确表面请离线
+  大规模生产需按叶批处理（未做）——这个量级下 `np.add.at` 的稠密散射也可能更快，本路径的
+  价值在于结果直接在 GPU 上、免回传。`union_spheres` 的 min-of-spheres 距离在重叠粒子间
+  的凹桥区是真实距离的上界（min 保 1-Lipschitz，并集外部精确）；两处已知偏差：**透镜重叠
+  区**（点同在两球内部）取的是更深那颗，比联合体真实边界偏深；**中轴脊上梯度不连续**，
+  法向会在脊线两侧跳变——做碰撞/渲染代理够用，做表面重建会出菱形接缝，精确表面请离线
   用正规表面重建精修。
 - `.vdb` 读侧不支持：实例化网格（instance parent）、点云网格（PointDataGrid）、
-  `5_4_3` 以外的树形；Blosc 压缩块需要可选依赖 `pip install blosc`（OpenVDB 帧级语义）。
+  `5_4_3` 以外的树形、**NonlinearFrustumMap 变换**（显式报错）；其余变换类型
+  （ScaleTranslate/Scale/UniformScale/Translation/Affine/Unitary）逐类型分发支持。
+  Blosc 压缩块需要可选依赖 `pip install blosc`（OpenVDB 帧级语义）。
   写侧不产生 root tile（全部以叶表达）；half 网格写侧升格 f32（读侧 half 网格支持）。
 - 与求解器自动微分的边界：XUVDB 提供的是**采样/写入原语**；把 VDB 值直接接入反传图需要
   包一层自定义求导规则（这正是 FastSweeping 等算子不可微的同一边界）。
 
 ## 许可证
 
-Apache-2.0（与上游 quadrants、genesis-world 一致），见 [LICENSE](LICENSE)。
+Apache-2.0（与上游 quadrants、genesis-world 一致），见 [LICENSE](https://atomgit.com/allan_/xuvdb/blob/main/LICENSE)。
 
 ## 版本与稳定性(1.0.0 起)
 
@@ -175,8 +200,14 @@ Apache-2.0（与上游 quadrants、genesis-world 一致），见 [LICENSE](LICEN
 - **公开 API** = 本 README 与 `xuvdb.__all__` 所列(`VdbGrid`/`Leaf`/`GpuVolume`/`VolumeBatch`/
   `save`/`load`/`write_vdb`/`read_vdb`/`ray_surface_hit`/`torch_bridge` 等);
   `xuvdb.kernels` 是内部实现,不承诺稳定;
-- **语义定案**:SDF `stamp_sphere` 按 min-union 复合(= `csg('union')`),fog stamp 覆盖写;
-- 性能基线见 [BENCHMARKS.md](BENCHMARKS.md)(可复现脚本 `examples/bench_suite.py`)。
+- **语义定案**:SDF `stamp_sphere` 按 min-union 复合(= `csg('union')`),fog stamp 覆盖写,
+  `scatter_*` 累加——三组动词三种语义,详见快速上手第 1 节的对照注释;
+- **参数单位**:`band`/`h` 以体素计,`background`/`radius` 以世界单位计,`leaf_log2` 是
+  log2(叶维 = 2^leaf_log2);改名留给 2.0(如 `band_voxels`),1.x 只文档化不改名;
+- **1.0 承诺范围**:承诺的是**格式稳定性与公开 API 稳定性,不承诺规模化性能**——
+  千级粒子的 splat、单网格量级的采样是当前验证过的规模;
+- 性能基线见 [BENCHMARKS.md](https://atomgit.com/allan_/xuvdb/blob/main/BENCHMARKS.md)
+  (可复现脚本 `examples/bench_suite.py`)。
 
 ## 测试
 

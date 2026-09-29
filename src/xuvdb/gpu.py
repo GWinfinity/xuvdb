@@ -177,13 +177,26 @@ class GpuVolume:
         self._dirty = True
         return self
 
-    def sync_to_host(self):
-        """Copy kernel-written values back into the host grid's leaves."""
+    def sync_to_host(self, refresh_mask=False):
+        """Copy kernel-written values back into the host grid's leaves.
+
+        Kernel writes land in the dense leaf buffers, so they flow through `sample*`, `.xuvdb`
+        save/load and `to_dense` regardless of the active mask - but `write_vdb` (active-mask
+        format) and the `active_*` queries are mask-filtered. `refresh_mask=True` re-marks every
+        voxel whose value differs from the background as active afterwards, so newly-written
+        cells become visible to mask-filtered consumers and the next packing; structural edits
+        (which the mask cannot express) still require a re-pack.
+        """
         per_leaf = self.grid.leaf_dim**3
         for i, leaf in enumerate(self.grid.leaves()):
             leaf.values[...] = self.values[i * per_leaf:(i + 1) * per_leaf].reshape(
                 self.grid.leaf_dim, self.grid.leaf_dim, self.grid.leaf_dim
             )
+            if refresh_mask:
+                new_mask = self.values[i * per_leaf:(i + 1) * per_leaf] != float(self.grid.background)
+                leaf.active[...] = new_mask.reshape(
+                    self.grid.leaf_dim, self.grid.leaf_dim, self.grid.leaf_dim
+                )
             leaf.invalidate()  # kernel writes changed values: derived stats are stale
         self._dirty = False
         return self.grid
