@@ -82,6 +82,19 @@ def test_affine_map_rigid_decomposition():
     assert s._pos == 128  # Mat4d
 
 
+def test_affine_map_with_shear_raises_instead_of_degrading():
+    """N-1: a sheared affine must fail loudly - silent degradation produced wrong geometry
+    (non-rigid linear part, column norms are not the true diagonal)."""
+    m = np.eye(4)
+    m[:3, :3] = np.array([[1.0, 0.3, 0.0],   # 0.3 off-diagonal = shear
+                          [0.0, 1.0, 0.0],
+                          [0.0, 0.0, 1.0]])
+    m[:3, 3] = [1.0, 2.0, 3.0]
+    s = FakeStream("AffineMap", m.astype("<f8").tobytes())
+    with pytest.raises(NotImplementedError, match="non-rigid"):
+        _read_transform(s, "AffineMap")
+
+
 def test_unitary_map_consumes_full_mat4():
     """Regression: UnitaryMap payloads are a full Mat4d (128 B); the pre-0.4 reader ate only
     72 bytes and desynced every following grid."""

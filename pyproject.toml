@@ -35,7 +35,7 @@ classifiers = [
 Homepage = "https://atomgit.com/allan_/xuvdb"
 Repository = "https://atomgit.com/allan_/xuvdb"
 Issues = "https://atomgit.com/allan_/xuvdb/issues"
-Changelog = "https://atomgit.com/allan_/xuvdb/blob/main/ROADMAP.md"
+Roadmap = "https://atomgit.com/allan_/xuvdb/blob/main/ROADMAP.md"
 Benchmarks = "https://atomgit.com/allan_/xuvdb/blob/main/BENCHMARKS.md"
 
 [project.optional-dependencies]
@@ -51,6 +51,9 @@ version = { attr = "xuvdb.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+xuvdb = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

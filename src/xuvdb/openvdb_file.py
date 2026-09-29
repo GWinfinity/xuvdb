@@ -648,7 +648,12 @@ def _read_transform(s, map_type):
         scale = np.linalg.norm(linear, axis=0)  # columns of R*diag(s) have length s_a
         rot = linear / scale
         if not np.allclose(rot @ rot.T, np.eye(3), atol=1e-6):
-            rot = None  # shear / general affine: keep only the diagonal part
+            # sheared / general affine: silently dropping the rotation part would produce wrong
+            # geometry - same standard as NonlinearFrustumMap, fail loudly instead
+            raise NotImplementedError(
+                f"{map_type} with a non-rigid linear part (shear or non-uniform rotation-scale "
+                "coupling) is not supported; only rigid maps decomposable as R @ diag(scale) are"
+            )
         return scale, m[:3, 3].copy(), rot
     raise NotImplementedError(f"unsupported transform map type {map_type!r}")
 

@@ -43,7 +43,7 @@ class GpuVolume:
         for i, leaf in enumerate(leaves):
             values[i * per_leaf:(i + 1) * per_leaf] = leaf.values.ravel()  # z-fastest C order
             bits = np.packbits(leaf.active.reshape(-1), bitorder="little")  # bit n = voxel n
-            self.mask[i] = bits.view(np.uint32)
+            self.mask[i] = bits.view("<u4")  # explicit LE
         self.keys = keys
         self.values = values
         self.background = float(grid.background)

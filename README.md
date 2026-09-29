@@ -28,8 +28,12 @@
 | 端到端可微 | ❌ | ❌ | 采样对叶值/坐标有解析梯度（`torch_bridge.sample_t`）；稀疏卷积等训练算子仍无 |
 | Python 依赖 | pyopenvdb（需自行构建） | C++ 工具链 | numpy + quadrants（quadrants 是带 JIT 的完整工具链：首次调用现场编译内核；GPU 需驱动，无 GPU 时 CPU 后端可用——射线慢 ~450 倍、采样只慢 ~4 倍，见 BENCHMARKS.md） |
 
-头条数字（300 粒子网格、CPU 后端）：内核三线性 **~39M 点/s**，内核批量射线 **~156k 射线/s**
-（宿主逐点 0.3k/s），稀疏存储相对同分辨率稠密省 ~98% 内存。完整表与复现脚本见 BENCHMARKS.md。
+头条数字（**300 粒子网格**，即「千级粒子」验证规模；CPU 后端）：内核三线性
+**~39M 点/s**，内核批量射线 **~156k 射线/s**（宿主逐点 0.3k/s）。
+**内存的诚实账**：本基准网格活动体素占包围盒的 55%，这个占用率下稀疏叶表（60 叶 × 16³
+稠密缓冲 ≈ 1.0MB）反而比包围盒稠密（237KB）**大**——稀疏叶格式的内存优势只在**低占用率**
+（活动占比远低于 1/叶体素数 ≈ 0.4%）或域远大于包围盒时成立；落盘后经 active-mask + Blosc
+压缩可回到 ~120KB 量级。完整表、复现脚本与规模声明见 BENCHMARKS.md 与「版本与稳定性」一节。
 
 定位不是替换任何求解器，而是补一个**可编辑的稀疏空间表示层**。
 
@@ -122,7 +126,7 @@ dense, ijk_min = sparse.to_dense()        # 反向：渲染器 / 求解器输入
 ### `.xuvdb`（自有格式 v2，小端）
 
 ```
-"XUVDB" | u8 version=2 | u8 flags(bit0=zlib 载荷, bit1=CRC32 尾注) | u16 n_grids
+"XUVDB" | u8 version=2 | u8 flags(bit0=zlib 载荷, bit1=CRC32 尾注) | u32 n_grids
 payload（bit0 时为 zlib 压缩）:
 per grid:
   str name | u8 type(0=f32,1=f64,2=vec3f,3=f16) | u8 leaf_log2 | u8 class
@@ -198,8 +202,9 @@ Apache-2.0（与上游 quadrants、genesis-world 一致），见 [LICENSE](https
 - **semver**:主版本 = 破坏性变更,次版本 = 向后兼容的新功能,修订 = 修复;
 - **`.xuvdb` 格式 v2 冻结**:v1 永久可读;未来字段只增不改,版本号随破坏性变更递增;
 - **公开 API** = 本 README 与 `xuvdb.__all__` 所列(`VdbGrid`/`Leaf`/`GpuVolume`/`VolumeBatch`/
-  `save`/`load`/`write_vdb`/`read_vdb`/`ray_surface_hit`/`torch_bridge` 等);
-  `xuvdb.kernels` 是内部实现,不承诺稳定;
+  `save`/`load`/`write_vdb`/`read_vdb`/`to_openvdb`/`from_openvdb`/`ray_surface_hit`/
+  `torch_bridge`/`init_runtime`);`xuvdb.kernels` 是内部实现,不承诺稳定;
+  类型标注随包分发(`py.typed`)。
 - **语义定案**:SDF `stamp_sphere` 按 min-union 复合(= `csg('union')`),fog stamp 覆盖写,
   `scatter_*` 累加——三组动词三种语义,详见快速上手第 1 节的对照注释;
 - **参数单位**:`band`/`h` 以体素计,`background`/`radius` 以世界单位计,`leaf_log2` 是

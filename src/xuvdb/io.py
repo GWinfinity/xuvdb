@@ -10,7 +10,7 @@ Format (little-endian throughout; `u` = unsigned, `i` = signed, `f` = IEEE float
     magic    5 bytes "XUVDB"
     version  u8       (2; version 1 files read exactly as before)
     flags    u8       bit0 = payload is zlib-deflated, bit1 = CRC32 trailer present
-    n_grids  u16
+    n_grids  u32
 
     payload (optionally deflated when flags bit0):
     per grid:
@@ -68,7 +68,7 @@ def _pack_str(s):
 def _mask_words(active):
     """Pack a bool (dim,dim,dim) mask into u64 words, bit n = voxel n (z-fastest C order)."""
     bits = np.packbits(active.reshape(-1), bitorder="little")
-    return np.pad(bits, (0, (-len(bits)) % 8)).view(np.uint64)
+    return np.pad(bits, (0, (-len(bits)) % 8)).view("<u8")  # explicit LE, matching the format
 
 
 def _mask_from_words(words, count):
