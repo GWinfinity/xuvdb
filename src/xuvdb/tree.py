@@ -77,10 +77,14 @@ class Leaf:
 class VdbGrid:
     """A named sparse voxel grid.
 
-    Supported value types are float32, float64 and 3-channel float32 (`vec3`); `background` is the
-    value returned outside the active region. Structural edits (`set_value`, `fill_box`,
-    `stamp_sphere`, CSG ops) allocate or free leaves on demand; `prune` drops leaves that carry no
-    active voxels.
+    Supported value types are float16, float32, float64 and 3-channel float32 (`vec3`);
+    `background` is the value returned outside the active region. Structural edits (`set_value`,
+    `fill_box`, `stamp_sphere`, CSG ops) allocate or free leaves on demand; `prune` drops leaves
+    that carry no active voxels.
+
+    The index->world map is the rigid affine `world = R @ (index * voxel_size) + origin_world`
+    with `rotation` an orthonormal 3x3 matrix (default identity). The quadrants kernels only
+    support axis-aligned grids (`rotation is identity`).
     """
 
     def __init__(
@@ -92,16 +96,19 @@ class VdbGrid:
         leaf_log2=DEFAULT_LEAF_LOG2,
         name="grid",
         grid_class="unknown",
+        rotation=None,
     ):
         dtype = np.dtype(dtype)
         if dtype == np.float32:
             self.value_shape, self.type_code = (), 0
+        elif dtype == np.float16:
+            self.value_shape, self.type_code = (), 3
         elif dtype == np.float64:
             self.value_shape, self.type_code = (), 1
         elif dtype == np.dtype([("x", np.float32), ("y", np.float32), ("z", np.float32)]):
             self.value_shape, self.type_code = (3,), 2
         else:
-            raise TypeError("dtype must be float32, float64 or the vec3 float32 record")
+            raise TypeError("dtype must be float16, float32, float64 or the vec3 float32 record")
         self.dtype = dtype
 
         background = np.asarray(background, dtype=np.float64).reshape(-1)
@@ -119,6 +126,14 @@ class VdbGrid:
         if np.any(self.voxel_size <= 0):
             raise ValueError("voxel_size components must be positive")
         self.origin_world = np.broadcast_to(np.asarray(origin_world, dtype=np.float64).reshape(-1), (3,)).copy()
+
+        if rotation is None:
+            self.rotation = np.eye(3)
+        else:
+            self.rotation = np.asarray(rotation, dtype=np.float64).reshape(3, 3).copy()
+            if not np.allclose(self.rotation @ self.rotation.T, np.eye(3), atol=1e-8):
+                raise ValueError("rotation must be an orthonormal 3x3 matrix")
+        self.is_axis_aligned = bool(np.allclose(self.rotation, np.eye(3)))
 
         self.name = str(name)
         if grid_class not in GRID_CLASSES:
@@ -236,6 +251,7 @@ class VdbGrid:
             leaf_log2=self.leaf_log2,
             name=self.name,
             grid_class=self.grid_class,
+            rotation=self.rotation,
         )
         for key, leaf in self._leaves.items():
             new = Leaf(leaf.origin, leaf.dim, self.value_shape, self.background)
@@ -317,18 +333,19 @@ class VdbGrid:
         """
         center = np.asarray(center, dtype=np.float64).reshape(3)
         vs = self.voxel_size
-        center_i = (center - self.origin_world) / vs
+        center_i = self.world_to_index(center)
         r_world = float(radius)
         sdf = value is None
         band_world = float(band) * float(np.mean(vs))
         # Index-space bounds generous enough to contain the band / the solid sphere.
-        reach_i = (r_world + (band_world if sdf else 0.0)) / vs + 1.0
+        reach = vs if self.is_axis_aligned else np.full(3, vs.min())  # rotated: conservative bound
+        reach_i = (r_world + (band_world if sdf else 0.0)) / reach + 1.0
         lo = np.floor(center_i - reach_i).astype(np.int64)
         hi = np.ceil(center_i + reach_i).astype(np.int64)
         for leaf, sl in self._for_each_leaf_slice(lo, hi):
             axes = [leaf.origin[a] + np.arange(sl[a].start, sl[a].stop) for a in range(3)]
-            gx, gy, gz = np.meshgrid(*[axes[a] * vs[a] + self.origin_world[a] for a in range(3)], indexing="ij")
-            dist = np.sqrt((gx - center[0]) ** 2 + (gy - center[1]) ** 2 + (gz - center[2]) ** 2)
+            wx, wy, wz = _slice_world_positions(self, leaf, sl)
+            dist = np.sqrt((wx - center[0]) ** 2 + (wy - center[1]) ** 2 + (wz - center[2]) ** 2)
             if sdf:
                 leaf.values[sl] = (dist - r_world).astype(np.float32)
                 leaf.active[sl] = np.abs(dist - r_world) <= band_world
@@ -377,13 +394,14 @@ class VdbGrid:
         elif weights.ndim != 1 or len(weights) != n:
             raise ValueError("weights must supply one scalar per particle")
 
-        reach_i = support / vs + 1.0
+        reach = vs if self.is_axis_aligned else np.full(3, vs.min())
+        reach_i = support / reach + 1.0
         for i in range(n):
-            center_i = (points[i] - self.origin_world) / vs
+            center_i = self.world_to_index(points[i])
             lo = np.floor(center_i - reach_i).astype(np.int64)
             hi = np.ceil(center_i + reach_i).astype(np.int64)
             for leaf, sl in self._for_each_leaf_slice(lo, hi):
-                dist = _slice_world_distance(leaf, sl, vs, self.origin_world, points[i])
+                dist = _slice_world_distance(self, leaf, sl, points[i])
                 q = dist / h
                 if kernel == "cubic":
                     w = np.where(q < 1.0, 1.0 - 1.5 * q * q + 0.75 * q * q * q, 0.25 * (2.0 - q) ** 3)
@@ -421,12 +439,13 @@ class VdbGrid:
         band_world = float(band) * float(np.mean(vs))
         for center, r_world in zip(centers, radius):
             r_world = float(r_world)
-            center_i = (center - self.origin_world) / vs
-            reach_i = (r_world + band_world) / vs + 1.0
+            center_i = self.world_to_index(center)
+            reach = vs if self.is_axis_aligned else np.full(3, vs.min())
+            reach_i = (r_world + band_world) / reach + 1.0
             lo = np.floor(center_i - reach_i).astype(np.int64)
             hi = np.ceil(center_i + reach_i).astype(np.int64)
             for leaf, sl in self._for_each_leaf_slice(lo, hi):
-                dist = _slice_world_distance(leaf, sl, vs, self.origin_world, center)
+                dist = _slice_world_distance(self, leaf, sl, center)
                 sdf = dist - r_world
                 leaf.values[sl] = np.minimum(leaf.values[sl], sdf.astype(np.float32))
                 leaf.active[sl] |= np.abs(sdf) <= band_world
@@ -473,7 +492,11 @@ class VdbGrid:
     # ------------------------------------------------------------------ dense conversion
 
     def _numpy_value_dtype(self):
-        return np.float64 if self.type_code == 1 else np.float32
+        if self.type_code == 1:
+            return np.float64
+        if self.type_code == 3:
+            return np.float16
+        return np.float32
 
     def to_dense(self, bbox=None, pad=0):
         """Dense `(x, y, z[, 3])` array covering `bbox` (default: the active bbox), plus `ijk_min`.
@@ -548,10 +571,16 @@ class VdbGrid:
     # ------------------------------------------------------------------ transforms & sampling
 
     def index_to_world(self, ijk):
-        return np.asarray(ijk, dtype=np.float64) * self.voxel_size + self.origin_world
+        """`world = R @ (index * voxel_size) + origin_world` (rigid affine)."""
+        scaled = np.asarray(ijk, dtype=np.float64).reshape(-1, 3) * self.voxel_size
+        world = scaled @ self.rotation.T + self.origin_world
+        return world[0] if np.asarray(ijk).ndim == 1 else world
 
     def world_to_index(self, xyz):
-        return (np.asarray(xyz, dtype=np.float64) - self.origin_world) / self.voxel_size
+        """Inverse map: `index = (R^T @ (world - origin_world)) / voxel_size`."""
+        pts = (np.asarray(xyz, dtype=np.float64).reshape(-1, 3) - self.origin_world) @ self.rotation
+        idx = pts / self.voxel_size
+        return idx[0] if np.asarray(xyz).ndim == 1 else idx
 
     def sample_nearest(self, xyz):
         """Value at the voxel whose center is nearest to the world point."""
@@ -618,7 +647,7 @@ def _quad_weight(u, j):
 
 def _sample_quadratic(grid, points_world):
     """Vectorized triquadratic sampling of a scalar grid; one result per row of `points_world`."""
-    coords = (points_world - grid.origin_world) / grid.voxel_size
+    coords = grid.world_to_index(points_world)
     base = np.floor(coords).astype(np.int64)
     frac = coords - base
     n = len(points_world)
@@ -638,17 +667,24 @@ def _sample_quadratic(grid, points_world):
     return out
 
 
-def _slice_world_distance(leaf, sl, voxel_size, origin_world, center):
-    """World-space euclidean distance from `center` to every voxel center in a leaf slice."""
+def _slice_world_positions(grid, leaf, sl):
+    """World coordinates (x, y, z arrays) of the voxel centers in a leaf slice, affine-aware."""
     axes = [leaf.origin[a] + np.arange(sl[a].start, sl[a].stop) for a in range(3)]
-    gx, gy, gz = np.meshgrid(*[axes[a] * voxel_size[a] + origin_world[a] for a in range(3)], indexing="ij")
-    return np.sqrt((gx - center[0]) ** 2 + (gy - center[1]) ** 2 + (gz - center[2]) ** 2)
+    idx = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3) * grid.voxel_size
+    world = idx @ grid.rotation.T + grid.origin_world
+    return [world[:, a].reshape(len(axes[0]), len(axes[1]), len(axes[2])) for a in range(3)]
+
+
+def _slice_world_distance(grid, leaf, sl, center):
+    """World-space euclidean distance from `center` to every voxel center in a leaf slice."""
+    wx, wy, wz = _slice_world_positions(grid, leaf, sl)
+    return np.sqrt((wx - center[0]) ** 2 + (wy - center[1]) ** 2 + (wz - center[2]) ** 2)
 
 
 def _sample_linear(grid, points_world):
     """Vectorized trilinear sampling of a scalar grid; one result per row of `points_world`."""
     points_world = np.atleast_2d(np.asarray(points_world, dtype=np.float64))
-    coords = (points_world - grid.origin_world) / grid.voxel_size
+    coords = grid.world_to_index(points_world)
     base = np.floor(coords).astype(np.int64)
     frac = coords - base
     out = np.zeros(len(points_world), dtype=grid._numpy_value_dtype())

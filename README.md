@@ -56,11 +56,11 @@ grid.fill_box((-2, -2, -2), (2, 2, 2), value=0.0)         # 任意稠密填充�
 grid.prune()
 
 # 2) 自有格式落盘 / 读回（多网格、f32/f64/vec3）
-xuvdb.save("scene.xuvdb", [grid])
+xuvdb.save("scene.xuvdb", [grid], compress=True)   # v2: zlib 载荷 + CRC32 校验和（默认恒校验）
 grids = xuvdb.load("scene.xuvdb")
 
 # 3) 与 OpenVDB 互通（显式导出：真正的 OpenVDB 流，Houdini/Blender 直接打开）
-xuvdb.write_vdb("scene.vdb", [grid])
+xuvdb.write_vdb("scene.vdb", [grid], blosc=True)   # blosc=True 输出 Blosc 压缩值块（需 blosc 包）
 back = xuvdb.read_vdb("scene.vdb", grid_name="shield")
 
 # 4) 内核采样 / 写值（等同 Warp example_nvdb 的用法，但值可写）
@@ -135,14 +135,17 @@ per grid:
 
 ## 已知边界
 
-- `GpuVolume` 只支持 f32 标量网格；写入只改值不改拓扑、不动 active 掩码（掩码是宿主侧
-  状态）。结构性编辑后需重新打包。
+- `GpuVolume` 只支持 f32 标量网格（f16/f64/vec3 为宿主与格式层类型）；写入只改值不改拓扑、
+  不动 active 掩码（掩码是宿主侧状态）。结构性编辑后需重新打包。
+- 内核仅支持轴对齐网格；带 `rotation` 的网格在宿主侧全功能（采样/射线/stamp/两种格式），
+  交给 `GpuVolume` 会显式报错。
 - `scatter_particles`／`union_spheres` 是 Python 循环 + 叶切片向量化：千级粒子适用，
   大规模生产需按叶批处理（未做）。`union_spheres` 的 min-of-spheres 距离在重叠粒子间
   的凹桥区是真实距离的上界（Lipschitz 精确），做碰撞/渲染代理足够，精确表面请离线
   用正规表面重建精修。
-- `.vdb` 读侧不支持：Blosc 压缩、实例化网格（instance parent）、点云网格（PointDataGrid）、
-  `5_4_3` 以外的树形。写侧不产生 root tile（全部以叶表达）。
+- `.vdb` 读侧不支持：实例化网格（instance parent）、点云网格（PointDataGrid）、
+  `5_4_3` 以外的树形；Blosc 压缩块需要可选依赖 `pip install blosc`（OpenVDB 帧级语义）。
+  写侧不产生 root tile（全部以叶表达）；half 网格写侧升格 f32（读侧 half 网格支持）。
 - 与求解器自动微分的边界：XUVDB 提供的是**采样/写入原语**；把 VDB 值直接接入反传图需要
   包一层自定义求导规则（这正是 FastSweeping 等算子不可微的同一边界）。
 

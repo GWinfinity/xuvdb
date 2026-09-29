@@ -30,17 +30,24 @@ OpenVDB 流"。
 验收:三次采样与稠密独立参考实现逐点对齐(atol 1e-5)、内核-宿主奇偶(atol 2e-5)、
 常量场复现、球面梯度径向;统计与暴力计算一致;CPU/CUDA/Vulkan 三后端冒烟通过。
 
-## v0.4 — 生态互通
+## v0.4 — 生态互通 ✅ 0.4.0
 
-- [ ] `.vdb` 读侧支持 Blosc(Houdini 默认压缩,当前明确报错);
-- [ ] PointDataGrid 读侧(吃 Houdini 粒子缓存);
-- [ ] `.xuvdb` v2:校验和 + 可选压缩 + 版本迁移;
-- [ ] f16 值类型;仿射变换(带旋转)。
+- [x] `.vdb` 读侧支持 Blosc(OpenVDB `bloscToStream` 帧级语义:i64 长度前缀、clevel 9 +
+  byte shuffle;可选 `blosc` 包,缺包时明确报错),并补了**写侧**(可产生 Blosc 文件);
+- [x] `.xuvdb` v2:CRC32 校验和(恒在)+ 可选 zlib 载荷压缩 + 旋转矩阵字段,
+  v1 文件保持可读,损坏文件被校验和拦截;
+- [x] f16 值类型(原生格式 + 宿主;`.vdb` 写侧升格 f32,读侧 half 网格本就支持);
+- [x] 刚体仿射变换(`rotation` 正交阵:world = R@(index·s)+t,宿主采样/射线/stamp/
+  自有格式/`.vdb` AffineMap 读写全通;内核仅轴对齐,旋转网格显式报错)。
+- [ ] PointDataGrid 读侧 → **顺延 v0.5**:没有真实 Houdini 粒子缓存做测试,不可证伪的
+  代码不发布(读侧遇点云网格仍报明确错误)。
 
-验收:Houdini 默认设置导出的真实文件可读;损坏文件被校验和拦截。
+验收:Blosc 往返逐值一致;被篡改文件被 CRC 拦截;旋转网格采样/射线/两种格式往返与
+轴对齐数值一致;34+ 测试全绿。
 
 ## v0.5 — torch 桥(fVDB 方向的克制版:做互通,不做框架)
 
+- [ ] PointDataGrid 读侧(吃 Houdini 粒子缓存;需先收集真实测试文件);
 - [ ] 值缓冲 ⇄ `torch.Tensor`(含 CUDA 路径);
 - [ ] 可微采样包装(自定义 autograd function 包住 `GpuVolume.sample`);
 - [ ] 多网格批量打包/传输(GridBatch 式一次上下载)。

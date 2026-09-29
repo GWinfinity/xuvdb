@@ -35,18 +35,28 @@ def ray_surface_hit(grid, origin, direction, tmax=None, isovalue=0.0, refine_ste
     tmax = float(tmax)
 
     # pure-scalar march state: continuous index origin, index-space direction (t stays in world)
+    # index-space quantities: c0 = R^T (o - t) / s, di = R^T d / s (R = grid rotation)
     sx, sy, sz = (float(v) for v in grid.voxel_size)
-    oxw, oyw, ozw = (float(v) for v in grid.origin_world)
-    c0 = ((o[0] - oxw) / sx, (o[1] - oyw) / sy, (o[2] - ozw) / sz)
-    di = (d[0] / sx, d[1] / sy, d[2] / sz)
+    R = grid.rotation
+    o_idx = (o - grid.origin_world) @ R
+    d_idx = d @ R
+    c0 = (o_idx[0] / sx, o_idx[1] / sy, o_idx[2] / sz)
+    di = (d_idx[0] / sx, d_idx[1] / sy, d_idx[2] / sz)
     log2, dim = grid.leaf_log2, grid.leaf_dim
     eps = 1e-6 * min(sx, sy, sz) / max(math.sqrt(di[0] ** 2 + di[1] ** 2 + di[2] ** 2), 1e-30)
     leaves = grid._leaves
+    # world position of a voxel center: t + R @ (v * s); per-axis world steps for center_t
+    wxs = (float(R[0, 0]) * sx, float(R[0, 1]) * sy, float(R[0, 2]) * sz)
+    wys = (float(R[1, 0]) * sx, float(R[1, 1]) * sy, float(R[1, 2]) * sz)
+    wzs = (float(R[2, 0]) * sx, float(R[2, 1]) * sy, float(R[2, 2]) * sz)
+    oxw, oyw, ozw = (float(v) for v in grid.origin_world)
 
     def center_t(voxel):
         """World ray parameter at which the ray is closest to the voxel center's plane."""
-        return ((voxel[0] * sx + oxw) - o[0]) * d[0] + ((voxel[1] * sy + oyw) - o[1]) * d[1] \
-            + ((voxel[2] * sz + ozw) - o[2]) * d[2]
+        wx = oxw + voxel[0] * wxs[0] + voxel[1] * wxs[1] + voxel[2] * wxs[2] - o[0]
+        wy = oyw + voxel[0] * wys[0] + voxel[1] * wys[1] + voxel[2] * wys[2] - o[1]
+        wz = ozw + voxel[0] * wzs[0] + voxel[1] * wzs[1] + voxel[2] * wzs[2] - o[2]
+        return wx * d[0] + wy * d[1] + wz * d[2]
 
     def leaf_entry(key):
         """Per-leaf, per-ray cached march plan: `(t_enter, t_exit)` of the active bbox, or None."""

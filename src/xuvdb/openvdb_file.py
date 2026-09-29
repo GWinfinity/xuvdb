@@ -36,6 +36,11 @@ import numpy as np
 
 from .tree import GRID_CLASSES, VdbGrid
 
+try:
+    import blosc
+except ImportError:  # blosc-compressed .vdb files need the optional `pip install blosc`
+    blosc = None
+
 OPENVDB_MAGIC = 0x56444220
 FILE_VERSION = 224
 LIB_MAJOR, LIB_MINOR = 11, 0
@@ -187,12 +192,15 @@ def _mask_words_for(count):
 # ------------------------------------------------------------------ writer
 
 
-def write_vdb(path, grids):
+def write_vdb(path, grids, blosc=False):
     """Write one or more `VdbGrid`s as a spec-conformant `.vdb` file readable by OpenVDB/Houdini.
 
     This is the explicit interop export: it emits a real OpenVDB stream, so the `.vdb` suffix is
-    correct here - and expected, since the suffix is what volume tools key on.
+    correct here - and expected, since the suffix is what volume tools key on. `blosc=True` emits
+    Blosc-compressed value blocks (clevel 9, byte shuffle; OpenVDB's own framing) and needs the
+    optional 'blosc' package. Half grids are upcast to float32 on write.
     """
+    grids = [_as_f32(g) if g.type_code == 3 else g for g in grids]
     if not str(path).lower().endswith(".vdb"):
         warnings.warn(f"writing an OpenVDB stream to {str(path)!r} without the '.vdb' suffix; "
                       "volume tools identify OpenVDB files by extension")
@@ -220,7 +228,7 @@ def write_vdb(path, grids):
         s.i64(0)
         s.i64(0)
         grid_pos = s.tell()
-        block_pos = _write_grid_stream(s, grid)
+        block_pos = _write_grid_stream(s, grid, blosc=blosc)
         end_pos = s.tell()
         s.patch_i64(offset_pos, grid_pos)
         s.patch_i64(offset_pos + 8, block_pos)
@@ -231,9 +239,9 @@ def write_vdb(path, grids):
     return len(s.buf)
 
 
-def _write_grid_stream(s, grid):
+def _write_grid_stream(s, grid, blosc=False):
     """Emit one grid's metadata, transform, topology and buffers; returns the block (buffers) offset."""
-    s.u32(COMPRESS_ACTIVE_MASK)
+    s.u32(COMPRESS_ACTIVE_MASK | (COMPRESS_BLOSC if blosc else 0))
 
     bbox = grid.bbox()
     meta = [("name", "string", grid.name.encode("utf-8")),
@@ -249,16 +257,23 @@ def _write_grid_stream(s, grid):
         s.u32(len(payload))
         s.raw(payload)
 
-    # transform: ScaleTranslateMap
-    s.string("ScaleTranslateMap")
-    t = grid.origin_world
-    vs = grid.voxel_size
-    s.vec3d(t)
-    s.vec3d(vs)
-    s.vec3d(vs)
-    s.vec3d(1.0 / vs)
-    s.vec3d(1.0 / vs**2)
-    s.vec3d(0.5 / vs)
+    # transform: AffineMap for rotated grids (row-major Mat4d), ScaleTranslateMap otherwise
+    if grid.is_axis_aligned:
+        s.string("ScaleTranslateMap")
+        t = grid.origin_world
+        vs = grid.voxel_size
+        s.vec3d(t)
+        s.vec3d(vs)
+        s.vec3d(vs)
+        s.vec3d(1.0 / vs)
+        s.vec3d(1.0 / vs**2)
+        s.vec3d(0.5 / vs)
+    else:
+        s.string("AffineMap")
+        m = np.eye(4)
+        m[:3, :3] = grid.rotation * grid.voxel_size  # world = R @ (index * s) + t
+        m[:3, 3] = grid.origin_world
+        s.raw(m.astype("<f8").tobytes())
 
     # ---- tree topology
     tree = _build_vdb_tree(grid)
@@ -290,12 +305,12 @@ def _write_grid_stream(s, grid):
         for int4 in int5["children"]:
             for leaf in int4["children"]:
                 s.raw(_pack_mask(leaf["active"]).astype("<u8").tobytes())
-                _write_compressed_values(s, leaf["values"], leaf["active"], grid)
+                _write_compressed_values(s, leaf["values"], leaf["active"], grid, blosc)
 
     return block_pos
 
 
-def _write_compressed_values(s, values, active, grid):
+def _write_compressed_values(s, values, active, grid, blosc=False):
     """One leaf value block under COMPRESS_ACTIVE_MASK: metadata 0 (or 2/5/6) + active values."""
     flat = values.reshape(-1) if not grid.is_vec else values.reshape(-1, 3)
     inactive = flat[~active.reshape(-1)]
@@ -326,11 +341,39 @@ def _write_compressed_values(s, values, active, grid):
         s.raw(np.asarray(distinct[1], dtype=wire_dtype).tobytes())
         selection = (flat == distinct[1]).all(axis=-1) if grid.is_vec else (flat == distinct[1])
         s.raw(_pack_mask(selection & ~active.reshape(-1)).astype("<u8").tobytes())
-    if metadata == _NO_MASK_AND_ALL_VALS:
-        s.raw(flat.astype(wire_dtype).tobytes())
+    payload = (flat if metadata == _NO_MASK_AND_ALL_VALS else flat[active.reshape(-1)]).astype(wire_dtype)
+    _emit_value_payload(s, np.ascontiguousarray(payload).tobytes(), blosc)
+
+
+def _emit_value_payload(s, payload, blosc):
+    """The leaf's value buffer with bloscToStream semantics: i64 length (positive = Blosc frame,
+    negative = -raw size) then the bytes; falls back to raw when compression does not shrink.
+    Frame parameters mirror OpenVDB's bloscCompress (clevel 9, byte shuffle)."""
+    if not blosc:
+        s.raw(payload)
+        return
+    if blosc is None:
+        raise ImportError("blosc output requires the optional 'blosc' package (pip install blosc)")
+    frame = blosc.compress(payload, typesize=4 if len(payload) % 4 == 0 else 1,
+                           clevel=9, shuffle=blosc.SHUFFLE)
+    if len(frame) < len(payload):
+        s.raw(struct.pack("<q", len(frame)))
+        s.raw(frame)
     else:
-        actives = flat[active.reshape(-1)]
-        s.raw(actives.astype(wire_dtype).tobytes())
+        s.raw(struct.pack("<q", -len(payload)))
+        s.raw(payload)
+
+
+def _as_f32(grid):
+    """Upcast a half grid to float32 (same structure) for the .vdb writer."""
+    out = VdbGrid(background=grid.background, voxel_size=grid.voxel_size,
+                  origin_world=grid.origin_world, leaf_log2=grid.leaf_log2,
+                  name=grid.name, grid_class=grid.grid_class, rotation=grid.rotation)
+    for key, leaf in grid._leaves.items():
+        new = out._get_or_create_leaf(key)
+        new.values[...] = leaf.values
+        new.active[...] = leaf.active
+    return out
 
 
 def _build_vdb_tree(grid):
@@ -467,15 +510,15 @@ def _read_meta_map(s):
 
 def _read_grid_stream(s, name, grid_type, from_half, leaf_log2, max_tile_voxels):
     compression = s.u32()
-    if compression & COMPRESS_BLOSC:
-        raise NotImplementedError(
-            f"grid {name!r} uses Blosc compression; re-save it with zip or no compression "
-            "(e.g. OpenVDB <= 9 defaults, or vdb_print --compression modes without blosc)"
+    if compression & COMPRESS_BLOSC and blosc is None:
+        raise ImportError(
+            f"grid {name!r} uses Blosc compression; install the optional 'blosc' package "
+            "(pip install blosc) to read it"
         )
     meta = _read_meta_map(s)
 
     map_type = s.string()
-    voxel_size, origin_world = _read_transform(s, map_type)
+    voxel_size, origin_world, rotation = _read_transform(s, map_type)
 
     s.i32()  # buffer count (1, the pre-222 multi-buffer layout is gone)
 
@@ -491,7 +534,8 @@ def _read_grid_stream(s, name, grid_type, from_half, leaf_log2, max_tile_voxels)
     if grid_class not in GRID_CLASSES:
         grid_class = "unknown"
     grid = VdbGrid(dtype=dtype, background=background, voxel_size=voxel_size, origin_world=origin_world,
-                   leaf_log2=leaf_log2, name=meta.get("name", name), grid_class=grid_class)
+                   leaf_log2=leaf_log2, name=meta.get("name", name), grid_class=grid_class,
+                   rotation=rotation)
 
     n_tiles = s.u32()
     n_int5 = s.u32()
@@ -582,27 +626,30 @@ def _read_wire_value(s, dtype, components):
 
 
 def _read_transform(s, map_type):
+    """`(voxel_size, origin_world, rotation-or-None)`; AffineMap/UnitaryMap decompose the Mat4d
+    (row-major, translation in the last column) into `R @ diag(scale)` when it is rigid."""
     if map_type in ("ScaleTranslateMap", "UniformScaleTranslateMap"):
         t = s.vec3d()
         scale = s.vec3d()
         for _ in range(4):  # voxel size, inverse scale, inverse square, half-inverse
             s.vec3d()
-        return scale, t
+        return scale, t, None
     if map_type in ("ScaleMap", "UniformScaleMap"):
         scale = s.vec3d()
         for _ in range(4):
             s.vec3d()
-        return scale, np.zeros(3)
+        return scale, np.zeros(3), None
     if map_type == "TranslationMap":
         t = s.vec3d()
-        return np.ones(3), t
-    if map_type == "AffineMap":
+        return np.ones(3), t, None
+    if map_type in ("AffineMap", "UnitaryMap"):
         m = np.frombuffer(s.raw(16 * 8), dtype="<f8").reshape(4, 4)
-        scale = np.array([m[0, 0], m[1, 1], m[2, 2]])
-        return scale, np.array([m[0, 3], m[1, 3], m[2, 3]])
-    if map_type == "UnitaryMap":
-        m = np.frombuffer(s.raw(9 * 8), dtype="<f8").reshape(3, 3)
-        return np.ones(3), np.zeros(3)
+        linear = m[:3, :3]
+        scale = np.linalg.norm(linear, axis=0)  # columns of R*diag(s) have length s_a
+        rot = linear / scale
+        if not np.allclose(rot @ rot.T, np.eye(3), atol=1e-6):
+            rot = None  # shear / general affine: keep only the diagonal part
+        return scale, m[:3, 3].copy(), rot
     raise NotImplementedError(f"unsupported transform map type {map_type!r}")
 
 
@@ -650,6 +697,19 @@ def _read_compressed_values(s, count, value_mask, value_dtype, components, backg
 
 
 def _read_data_blob(s, num_bytes, compression):
+    if compression & COMPRESS_BLOSC:
+        if blosc is None:
+            raise ImportError(
+                "this .vdb uses Blosc compression; install the optional 'blosc' package "
+                "(pip install blosc) to read it"
+            )
+        (nbytes,) = struct.unpack("<q", s.raw(8))
+        if nbytes < 0:  # OpenVDB writes a negative length when the block stayed uncompressed
+            return s.raw(-nbytes)
+        raw = blosc.decompress(s.raw(nbytes))
+        if len(raw) != num_bytes:
+            raise ValueError(f"blosc block decompressed to {len(raw)} bytes, expected {num_bytes}")
+        return raw
     if compression & COMPRESS_ZIP:
         (zsize,) = struct.unpack("<q", s.raw(8))
         if zsize <= 0:
