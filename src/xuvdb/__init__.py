@@ -39,7 +39,7 @@ Kernels run on any quadrants backend; call `init_runtime()` once before the firs
 `gs.init()` has not run (mirroring `genesis.occ`).
 """
 
-from .gpu import GpuVolume
+from .gpu import GpuVolume, VolumeBatch
 from .io import load, save
 from .openvdb_bridge import from_openvdb, to_openvdb
 from .openvdb_file import read_vdb, write_vdb
@@ -48,12 +48,13 @@ from .runtime import init_runtime
 from . import torch_bridge
 from .tree import Leaf, VdbGrid
 
-__version__ = "0.5.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "GpuVolume",
     "Leaf",
     "VdbGrid",
+    "VolumeBatch",
     "from_openvdb",
     "init_runtime",
     "load",

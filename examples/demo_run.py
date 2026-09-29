@@ -1,8 +1,9 @@
 """End-to-end run of the XUVDB project: every flow from the README quick-start, with checks.
 
-Adaptations vs the README text (verified against the 0.1.0 source):
-- union of two spheres uses two grids + `csg('union')`; two `stamp_sphere` calls on one grid
-  overwrite (last writer wins), which is not a union;
+Notes:
+- since 1.0.0, SDF `stamp_sphere` composes by MIN-union, so two stamps on one grid ARE a
+  CSG union; this demo keeps the explicit `csg(second, 'union')` form because it exercises
+  more API surface (and the two forms are verified equivalent in tests/test_v10.py);
 - `read_vdb` returns a list of grids;
 - the `.vdb` roundtrip is compared on narrow-band points: the OpenVDB stream only stores
   ACTIVE voxel values (+ lazy +-background for inactive ones), so inactive exact-distance

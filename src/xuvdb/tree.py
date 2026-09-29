@@ -327,9 +327,12 @@ class VdbGrid:
     def stamp_sphere(self, center, radius, value=None, band=3.0):
         """Stamp an analytic sphere (world-space `center`).
 
-        With `value` given, voxels inside the sphere get that constant (a fog-volume style stamp).
-        Without `value`, voxels get the exact signed distance `|p - center| - radius` (a level-set
-        stamp) and the active set is the narrow band `|distance| <= band * mean(voxel_size)`.
+        With `value` given, voxels inside the sphere get that constant (a fog-volume style stamp;
+        repeated fog stamps overwrite). Without `value`, this is a level-set stamp: values compose
+        by MIN-union with the existing field (same semantics as `csg(other, 'union')`), so repeated
+        SDF stamps build a true CSG union - two spheres stamped on one grid intersect cleanly
+        instead of overwriting each other. The active set is the union of the existing band and
+        the new sphere's `|distance| <= band * mean(voxel_size)` band.
         """
         center = np.asarray(center, dtype=np.float64).reshape(3)
         vs = self.voxel_size
@@ -347,8 +350,12 @@ class VdbGrid:
             wx, wy, wz = _slice_world_positions(self, leaf, sl)
             dist = np.sqrt((wx - center[0]) ** 2 + (wy - center[1]) ** 2 + (wz - center[2]) ** 2)
             if sdf:
-                leaf.values[sl] = (dist - r_world).astype(np.float32)
-                leaf.active[sl] = np.abs(dist - r_world) <= band_world
+                # SDF stamps compose by MIN-union (identical to `csg(other, 'union')`): the
+                # existing narrow band stays active, the new sphere's band joins it. Fog stamps
+                # (a `value` given) overwrite - a constant fill has no union to compose.
+                d = (dist - r_world).astype(leaf.values.dtype)
+                leaf.values[sl] = np.minimum(leaf.values[sl], d)
+                leaf.active[sl] = leaf.active[sl] | (np.abs(d) <= band_world)
             else:
                 leaf.values[sl] = value
                 leaf.active[sl] = dist <= r_world

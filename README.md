@@ -168,6 +168,16 @@ per grid:
 
 Apache-2.0（与上游 quadrants、genesis-world 一致），见 [LICENSE](LICENSE)。
 
+## 版本与稳定性(1.0.0 起)
+
+- **semver**:主版本 = 破坏性变更,次版本 = 向后兼容的新功能,修订 = 修复;
+- **`.xuvdb` 格式 v2 冻结**:v1 永久可读;未来字段只增不改,版本号随破坏性变更递增;
+- **公开 API** = 本 README 与 `xuvdb.__all__` 所列(`VdbGrid`/`Leaf`/`GpuVolume`/`VolumeBatch`/
+  `save`/`load`/`write_vdb`/`read_vdb`/`ray_surface_hit`/`torch_bridge` 等);
+  `xuvdb.kernels` 是内部实现,不承诺稳定;
+- **语义定案**:SDF `stamp_sphere` 按 min-union 复合(= `csg('union')`),fog stamp 覆盖写;
+- 性能基线见 [BENCHMARKS.md](BENCHMARKS.md)(可复现脚本 `examples/bench_suite.py`)。
+
 ## 测试
 
 ```

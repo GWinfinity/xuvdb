@@ -57,11 +57,14 @@ OpenVDB 流"。
 
 不做:稀疏卷积 / attention / 训练算子——正确姿势是提供导出接口。
 
-## v1.0 — 稳定承诺
+## v1.0 — 稳定承诺 ✅ 1.0.0
 
-- [ ] `.xuvdb` v2 格式冻结 + 向后兼容保证;
-- [ ] semver 承诺、公开 API 审查(定死 `stamp_sphere` 的覆盖 vs min-union 语义);
-- [ ] 与 NanoVDB 的公开性能基线对比。
+- [x] `.xuvdb` v2 格式冻结,v1 永久可读(测试锁定 `io.VERSION == 2`);
+- [x] semver 承诺 + 公开 API 冻结清单(测试锁定;`xuvdb.kernels` 声明为内部);
+- [x] `stamp_sphere` 语义定案:SDF stamp 按 min-union 复合(与 `csg('union')` 逐叶等价,
+  测试锁定),fog stamp 覆盖写——README 快速上手里"两次 stamp 即 CSG"从愿景变为事实;
+- [x] 公开性能基线 [BENCHMARKS.md](BENCHMARKS.md)(可复现脚本;含与 NanoVDB 的设计级
+  对比说明——真正的 head-to-head 需要 NanoVDB C++ 构建,欢迎贡献)。
 
 ---
 

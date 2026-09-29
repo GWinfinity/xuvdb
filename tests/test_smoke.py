@@ -8,7 +8,7 @@ C2, R2 = np.array([0.5, 0.2, 0.1]), 0.10
 
 
 def make_union_grid():
-    """Narrow-band level set of two spheres unioned via csg (stamp overwrites; it is not CSG)."""
+    """Narrow-band level set of two spheres unioned via csg (equivalent to two stamps since 1.0.0)."""
     grid = xuvdb.VdbGrid(background=3 * 0.05, voxel_size=0.05, leaf_log2=4,
                          name="shield", grid_class="level set")
     grid.stamp_sphere(C1, radius=R1, band=3.0)
