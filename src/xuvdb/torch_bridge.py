@@ -106,7 +106,13 @@ def _corner_weights(frac):
     return w
 
 
-class _Trilinear(torch.autograd.Function):
+_AutogradFunction = torch.autograd.Function if torch is not None else object
+
+
+class _Trilinear(_AutogradFunction):
+    """Defined as a plain class when torch is absent (never touched - sample/sample_t raise
+    a clear ImportError first); subclassing autograd.Function needs torch at class-creation
+    time, which is exactly what broke torch-less installs of 0.5.0."""
     """out = trilinear(field(values), points); gradients w.r.t. values (scatter-add) and points
     (analytic corner-weight derivatives, scaled by 1/voxel_size)."""
 
