@@ -1,0 +1,96 @@
+"""Host-side packing of a `VdbGrid` into flat buffers consumed by `kernels.py`.
+
+A `GpuVolume` is the read-mostly, kernel-writable view of a scalar grid - the XUVDB counterpart of
+a NanoVDB device buffer, except that values are mutable from kernels. Topology is frozen at pack
+time; call `sync_to_host()` to pull kernel-written values back into the host tree, and re-create
+the volume after structural edits (leaf allocation, prune, load).
+"""
+
+import numpy as np
+
+from . import kernels
+from .runtime import init_runtime
+from .tree import VdbGrid
+
+_KEY_OFF = 1 << 19
+
+
+def _pack_key(kx, ky, kz):
+    return (int(kx) + _KEY_OFF) * (1 << 40) + (int(ky) + _KEY_OFF) * (1 << 20) + (int(kz) + _KEY_OFF)
+
+
+class GpuVolume:
+    """Flat, key-sorted leaf table of a scalar grid plus kernel entry points."""
+
+    def __init__(self, grid):
+        if not isinstance(grid, VdbGrid):
+            raise TypeError("GpuVolume wraps a genesis.xuvdb.VdbGrid")
+        if grid.is_vec or grid.type_code == 1:
+            raise TypeError("kernel packing currently supports float32 scalar grids")
+        if grid.n_leaves == 0:
+            raise ValueError("grid has no leaves")
+        init_runtime()
+        self.grid = grid
+        leaves = grid.leaves()
+        keys = np.array([_pack_key(*key) for key in sorted(grid._leaves)], dtype=np.int64)
+        if not np.all(keys[:-1] < keys[1:]):
+            raise ValueError("leaf keys out of range or duplicated")
+        per_leaf = grid.leaf_dim**3
+        values = np.empty(len(leaves) * per_leaf, dtype=np.float32)
+        for i, leaf in enumerate(leaves):
+            values[i * per_leaf:(i + 1) * per_leaf] = leaf.values.ravel()  # z-fastest C order
+        self.keys = keys
+        self.values = values
+        self.background = float(grid.background)
+        self._dirty = False
+
+    # ------------------------------------------------------------------ queries
+
+    def sample(self, points, linear=False):
+        """Sample the packed volume at world-space points (N,3)."""
+        points = np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 3)
+        out = np.empty(len(points), dtype=np.float32)
+        kernel = kernels.kernel_sample_linear if linear else kernels.kernel_sample_nearest
+        kernel(
+            self.keys, self.values, int(self.grid.n_leaves), int(self.grid.leaf_log2), float(self.background),
+            *(float(v) for v in self.grid.origin_world), *(float(v) for v in self.grid.voxel_size),
+            points, out,
+        )
+        return out
+
+    def sdf_normal(self, points):
+        """Central-difference SDF gradient (world-space, normalized) at world-space points."""
+        points = np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 3)
+        out = np.empty((len(points), 3), dtype=np.float32)
+        kernels.kernel_sdf_normal(
+            self.keys, self.values, int(self.grid.n_leaves), int(self.grid.leaf_log2), float(self.background),
+            *(float(v) for v in self.grid.origin_world), *(float(v) for v in self.grid.voxel_size),
+            points, out,
+        )
+        return out
+
+    # ------------------------------------------------------------------ mutation
+
+    def write_voxels(self, points, new_values):
+        """Overwrite voxel values from kernels; call `sync_to_host` to publish into the tree."""
+        points = np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 3)
+        new_values = np.ascontiguousarray(new_values, dtype=np.float32).reshape(-1)
+        if len(new_values) != len(points):
+            raise ValueError("new_values must have one entry per point")
+        kernels.kernel_write_voxels(
+            self.keys, self.values, int(self.grid.n_leaves), int(self.grid.leaf_log2),
+            *(float(v) for v in self.grid.origin_world), *(float(v) for v in self.grid.voxel_size),
+            points, new_values,
+        )
+        self._dirty = True
+        return self
+
+    def sync_to_host(self):
+        """Copy kernel-written values back into the host grid's leaves."""
+        per_leaf = self.grid.leaf_dim**3
+        for i, leaf in enumerate(self.grid.leaves()):
+            leaf.values[...] = self.values[i * per_leaf:(i + 1) * per_leaf].reshape(
+                self.grid.leaf_dim, self.grid.leaf_dim, self.grid.leaf_dim
+            )
+        self._dirty = False
+        return self.grid

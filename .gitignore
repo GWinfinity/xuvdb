@@ -1,0 +1,17 @@
+# environments
+.venv*/
+venv/
+
+# python build / cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# tooling caches
+.pytest_cache/
+.quadrants/
+
+# demo output files (scene.xuvdb / scene.vdb etc.)
+demo_output/

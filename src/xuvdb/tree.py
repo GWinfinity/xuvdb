@@ -1,0 +1,494 @@
+"""The XUVDB sparse volume tree: a mutable, two-level voxel structure on the quadrants kernel.
+
+The design targets the gap between OpenVDB and NanoVDB: OpenVDB trees are fully mutable but live on
+the CPU behind a C++ library, while NanoVDB grids are GPU-resident but read-only. A XUVDB grid keeps a
+flat, dictionary-keyed set of dense leaf blocks that can be created, filled, carved and pruned from
+Python at any time, and whose packed value buffers can additionally be written by quadrants kernels
+(see `kernels.py` and `gpu.py`) without a host round trip.
+
+Layout: the root is a hash map from leaf-block origin to `Leaf`; each leaf owns one dense
+`(dim, dim, dim)` value array plus an active mask. `dim = 2**leaf_log2` (default 16). Memory layout
+follows the OpenVDB leaf convention - index `n = x * dim**2 + y * dim + z`, i.e. z varies fastest -
+so leaf data converts to and from `.vdb` files without transposes.
+
+Index-to-world convention matches OpenVDB linear maps: voxel (0,0,0) sits at `origin_world`, and
+`world = index * voxel_size + origin_world` (voxel centers at integer indices).
+"""
+
+import numpy as np
+
+DEFAULT_LEAF_LOG2 = 4
+
+GRID_CLASSES = ("unknown", "level set", "fog volume", "staggered")
+
+
+class Leaf:
+    """One dense `dim^3` block of voxels with a per-voxel active mask."""
+
+    __slots__ = ("origin", "values", "active")
+
+    def __init__(self, origin, dim, value_shape, background):
+        self.origin = np.asarray(origin, dtype=np.int64).reshape(3)
+        self.values = np.full((dim, dim, dim) + value_shape, background, dtype=np.float32)
+        self.active = np.zeros((dim, dim, dim), dtype=bool)
+
+    @property
+    def dim(self):
+        return self.values.shape[0]
+
+    @property
+    def n_active(self):
+        return int(self.active.sum())
+
+
+class VdbGrid:
+    """A named sparse voxel grid.
+
+    Supported value types are float32, float64 and 3-channel float32 (`vec3`); `background` is the
+    value returned outside the active region. Structural edits (`set_value`, `fill_box`,
+    `stamp_sphere`, CSG ops) allocate or free leaves on demand; `prune` drops leaves that carry no
+    active voxels.
+    """
+
+    def __init__(
+        self,
+        dtype=np.float32,
+        background=0.0,
+        voxel_size=(1.0, 1.0, 1.0),
+        origin_world=(0.0, 0.0, 0.0),
+        leaf_log2=DEFAULT_LEAF_LOG2,
+        name="grid",
+        grid_class="unknown",
+    ):
+        dtype = np.dtype(dtype)
+        if dtype == np.float32:
+            self.value_shape, self.type_code = (), 0
+        elif dtype == np.float64:
+            self.value_shape, self.type_code = (), 1
+        elif dtype == np.dtype([("x", np.float32), ("y", np.float32), ("z", np.float32)]):
+            self.value_shape, self.type_code = (3,), 2
+        else:
+            raise TypeError("dtype must be float32, float64 or the vec3 float32 record")
+        self.dtype = dtype
+
+        background = np.asarray(background, dtype=np.float64).reshape(-1)
+        if self.is_vec_shape(self.value_shape):
+            self.background = np.broadcast_to(background, (3,)).astype(np.float32).copy()
+        else:
+            self.background = float(background[0])
+
+        if not (2 <= int(leaf_log2) <= 6):
+            raise ValueError("leaf_log2 must be in [2, 6]")
+        self.leaf_log2 = int(leaf_log2)
+        self.leaf_dim = 1 << self.leaf_log2
+
+        self.voxel_size = np.broadcast_to(np.asarray(voxel_size, dtype=np.float64).reshape(-1), (3,)).copy()
+        if np.any(self.voxel_size <= 0):
+            raise ValueError("voxel_size components must be positive")
+        self.origin_world = np.broadcast_to(np.asarray(origin_world, dtype=np.float64).reshape(-1), (3,)).copy()
+
+        self.name = str(name)
+        if grid_class not in GRID_CLASSES:
+            raise ValueError(f"unsupported grid_class: {grid_class!r}; use one of {GRID_CLASSES}")
+        self.grid_class = grid_class
+        self._leaves = {}
+
+    @staticmethod
+    def is_vec_shape(value_shape):
+        return value_shape == (3,)
+
+    # ------------------------------------------------------------------ basic properties
+
+    @property
+    def is_vec(self):
+        return self.is_vec_shape(self.value_shape)
+
+    @property
+    def n_leaves(self):
+        return len(self._leaves)
+
+    leaf_count = property(lambda self: len(self._leaves))  # readability alias
+
+    @property
+    def active_voxel_count(self):
+        return int(sum(leaf.n_active for leaf in self._leaves.values()))
+
+    def leaves(self):
+        """Leaves in canonical (origin-sorted) order; the order every serializer uses."""
+        return [self._leaves[key] for key in sorted(self._leaves)]
+
+    def iter_voxels(self):
+        """Yield (coord, value) for every active voxel, leaf by leaf."""
+        for leaf in self.leaves():
+            ox, oy, oz = leaf.origin
+            xs, ys, zs = np.nonzero(leaf.active)
+            for x, y, z in zip(xs, ys, zs):
+                yield (int(ox + x), int(oy + y), int(oz + z)), leaf.values[x, y, z]
+
+    def bbox(self):
+        """Index-space integer (min, max) bounding box of active voxels, or None if empty."""
+        lo = hi = None
+        for leaf in self._leaves.values():
+            xs, ys, zs = np.nonzero(leaf.active)
+            if xs.size == 0:
+                continue
+            leaf_lo = leaf.origin + np.array([xs.min(), ys.min(), zs.min()])
+            leaf_hi = leaf.origin + np.array([xs.max(), ys.max(), zs.max()])
+            lo = leaf_lo if lo is None else np.minimum(lo, leaf_lo)
+            hi = leaf_hi if hi is None else np.maximum(hi, leaf_hi)
+        if lo is None:
+            return None
+        return lo, hi
+
+    def copy(self):
+        grid = VdbGrid(
+            dtype=self.dtype,
+            background=self.background,
+            voxel_size=self.voxel_size,
+            origin_world=self.origin_world,
+            leaf_log2=self.leaf_log2,
+            name=self.name,
+            grid_class=self.grid_class,
+        )
+        for key, leaf in self._leaves.items():
+            new = Leaf(leaf.origin, leaf.dim, self.value_shape, self.background)
+            new.values[...] = leaf.values
+            new.active[...] = leaf.active
+            grid._leaves[key] = new
+        return grid
+
+    # ------------------------------------------------------------------ leaf bookkeeping
+
+    def _leaf_key(self, ijk):
+        return (int(ijk[0]) >> self.leaf_log2, int(ijk[1]) >> self.leaf_log2, int(ijk[2]) >> self.leaf_log2)
+
+    def _get_or_create_leaf(self, key):
+        leaf = self._leaves.get(key)
+        if leaf is None:
+            leaf = Leaf(np.asarray(key) << self.leaf_log2, self.leaf_dim, self.value_shape, self.background)
+            self._leaves[key] = leaf
+        return leaf
+
+    # ------------------------------------------------------------------ point access
+
+    def set_value(self, ijk, value, active=True):
+        """Set one voxel (creating its leaf on demand) and mark it active."""
+        leaf = self._get_or_create_leaf(self._leaf_key(ijk))
+        local = (int(ijk[0]) - leaf.origin[0], int(ijk[1]) - leaf.origin[1], int(ijk[2]) - leaf.origin[2])
+        leaf.values[local] = value
+        leaf.active[local] = bool(active)
+
+    def get_value(self, ijk):
+        """Value at a voxel index; the background outside allocated leaves."""
+        leaf = self._leaves.get(self._leaf_key(ijk))
+        if leaf is None:
+            return self.background
+        local = (int(ijk[0]) - leaf.origin[0], int(ijk[1]) - leaf.origin[1], int(ijk[2]) - leaf.origin[2])
+        return leaf.values[local]
+
+    def probe(self, ijk):
+        """Return (value, active) at a voxel index."""
+        leaf = self._leaves.get(self._leaf_key(ijk))
+        if leaf is None:
+            return self.background, False
+        local = (int(ijk[0]) - leaf.origin[0], int(ijk[1]) - leaf.origin[1], int(ijk[2]) - leaf.origin[2])
+        return leaf.values[local], bool(leaf.active[local])
+
+    # ------------------------------------------------------------------ bulk edits
+
+    def _for_each_leaf_slice(self, ijk_min, ijk_max, create=True):
+        """Yield (leaf, local_slice) covering the integer box [ijk_min, ijk_max]."""
+        lo = np.minimum(ijk_min, ijk_max)
+        hi = np.maximum(ijk_min, ijk_max)
+        key_lo, key_hi = lo >> self.leaf_log2, hi >> self.leaf_log2
+        for kx in range(key_lo[0], key_hi[0] + 1):
+            for ky in range(key_lo[1], key_hi[1] + 1):
+                for kz in range(key_lo[2], key_hi[2] + 1):
+                    key = (kx, ky, kz)
+                    leaf = self._get_or_create_leaf(key) if create else self._leaves.get(key)
+                    if leaf is None:
+                        continue
+                    leaf_lo = np.maximum(lo, leaf.origin) - leaf.origin
+                    leaf_hi = np.minimum(hi, leaf.origin + self.leaf_dim - 1) - leaf.origin
+                    yield leaf, tuple(slice(leaf_lo[a], leaf_hi[a] + 1) for a in range(3))
+
+    def fill_box(self, ijk_min, ijk_max, value, active=True):
+        """Fill the axis-aligned integer index box [ijk_min, ijk_max] with a constant value."""
+        for leaf, sl in self._for_each_leaf_slice(np.asarray(ijk_min, dtype=np.int64),
+                                                  np.asarray(ijk_max, dtype=np.int64)):
+            leaf.values[sl] = value
+            leaf.active[sl] = bool(active)
+
+    def stamp_sphere(self, center, radius, value=None, band=3.0):
+        """Stamp an analytic sphere (world-space `center`).
+
+        With `value` given, voxels inside the sphere get that constant (a fog-volume style stamp).
+        Without `value`, voxels get the exact signed distance `|p - center| - radius` (a level-set
+        stamp) and the active set is the narrow band `|distance| <= band * mean(voxel_size)`.
+        """
+        center = np.asarray(center, dtype=np.float64).reshape(3)
+        vs = self.voxel_size
+        center_i = (center - self.origin_world) / vs
+        r_world = float(radius)
+        sdf = value is None
+        band_world = float(band) * float(np.mean(vs))
+        # Index-space bounds generous enough to contain the band / the solid sphere.
+        reach_i = (r_world + (band_world if sdf else 0.0)) / vs + 1.0
+        lo = np.floor(center_i - reach_i).astype(np.int64)
+        hi = np.ceil(center_i + reach_i).astype(np.int64)
+        for leaf, sl in self._for_each_leaf_slice(lo, hi):
+            axes = [leaf.origin[a] + np.arange(sl[a].start, sl[a].stop) for a in range(3)]
+            gx, gy, gz = np.meshgrid(*[axes[a] * vs[a] + self.origin_world[a] for a in range(3)], indexing="ij")
+            dist = np.sqrt((gx - center[0]) ** 2 + (gy - center[1]) ** 2 + (gz - center[2]) ** 2)
+            if sdf:
+                leaf.values[sl] = (dist - r_world).astype(np.float32)
+                leaf.active[sl] = np.abs(dist - r_world) <= band_world
+            else:
+                leaf.values[sl] = value
+                leaf.active[sl] = dist <= r_world
+
+    def scatter_particles(self, points, h=None, weights=None, kernel="cubic"):
+        """Splat particles onto the grid as a fog/density volume (additive SPH-style rasterization).
+
+        Each particle accumulates `weights[i] * W(r)` into every voxel within its support, with
+        W normalized to unit integral in 3D: `kernel='cubic'` is the SPH cubic spline, `'linear'` a
+        trilinear hat; both have support radius `2*h` (`h` defaults to two voxel sizes). Repeated
+        calls accumulate; voxels touched by a nonzero kernel weight become active. This is the
+        particle -> volume bridge for SPH liquids: density export for volume rendering, per-phase
+        mixture fractions (one grid per phase), or velocity rasterization (pass `(n, 3)` weights on
+        a vec3 grid).
+
+        Python loops over particles with vectorized leaf-slice kernels inside - adequate for
+        thousands of particles; batch large particle sets by leaf for production use.
+        """
+        if kernel not in ("cubic", "linear"):
+            raise ValueError("kernel must be 'cubic' or 'linear'")
+        points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        n = len(points)
+        if h is None:
+            h = 2.0 * float(np.mean(self.voxel_size))
+        h = float(h)
+        support = 2.0 * h
+        vs = self.voxel_size
+        if weights is None:
+            weights = np.ones(n)
+        weights = np.asarray(weights, dtype=np.float64)
+        if self.is_vec:
+            if weights.ndim == 0:
+                weights = np.full((n, 3), float(weights))
+            elif weights.ndim == 1 and weights.size == 3 and n == 1:
+                weights = weights.reshape(1, 3)
+            elif weights.ndim == 1 and weights.size == n:
+                weights = np.broadcast_to(weights[:, None], (n, 3))
+            elif weights.shape != (n, 3):
+                raise ValueError("vec3 grids need per-particle scalar or (n, 3) weights")
+        elif weights.ndim == 0:
+            weights = np.full(n, float(weights))
+        elif weights.ndim != 1 or len(weights) != n:
+            raise ValueError("weights must supply one scalar per particle")
+
+        reach_i = support / vs + 1.0
+        for i in range(n):
+            center_i = (points[i] - self.origin_world) / vs
+            lo = np.floor(center_i - reach_i).astype(np.int64)
+            hi = np.ceil(center_i + reach_i).astype(np.int64)
+            for leaf, sl in self._for_each_leaf_slice(lo, hi):
+                dist = _slice_world_distance(leaf, sl, vs, self.origin_world, points[i])
+                q = dist / h
+                if kernel == "cubic":
+                    w = np.where(q < 1.0, 1.0 - 1.5 * q * q + 0.75 * q * q * q, 0.25 * (2.0 - q) ** 3)
+                    w = np.where(q <= 2.0, w, 0.0) / (np.pi * h**3)
+                else:
+                    w = np.where(q <= 2.0, 1.0 - 0.5 * q, 0.0) * 3.0 / (np.pi * support**3)
+                touched = w > 0.0
+                if self.is_vec:
+                    leaf.values[sl] += w[..., None] * weights[i]
+                else:
+                    leaf.values[sl] += w * float(weights[i])
+                leaf.active[sl] |= touched
+        return self
+
+    def union_spheres(self, centers, radius, band=3.0):
+        """Union of per-particle sphere SDFs: a particle-level-set style surface proxy.
+
+        Writes `min(existing, |p - center_i| - radius_i)` across each sphere's reach, so repeated
+        calls compose into one liquid surface; the active set is the `|d| <= band * mean(voxel_size)`
+        narrow band. The min-of-spheres distance is an upper bound of the true union distance in
+        concave bridges between overlapping particles - Lipschitz-accurate as a collision/rendering
+        proxy, refine with a proper surface reconstructor offline if exactness matters.
+        `radius` is a world-space scalar or one value per particle.
+        """
+        centers = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+        if self.is_vec:
+            raise TypeError("union_spheres is defined on scalar grids only")
+        radius = np.asarray(radius, dtype=np.float64).reshape(-1)
+        if len(radius) == 1:
+            radius = np.repeat(radius, len(centers))
+        if len(radius) != len(centers):
+            raise ValueError("radius must be a scalar or match the particle count")
+        vs = self.voxel_size
+        band_world = float(band) * float(np.mean(vs))
+        for center, r_world in zip(centers, radius):
+            r_world = float(r_world)
+            center_i = (center - self.origin_world) / vs
+            reach_i = (r_world + band_world) / vs + 1.0
+            lo = np.floor(center_i - reach_i).astype(np.int64)
+            hi = np.ceil(center_i + reach_i).astype(np.int64)
+            for leaf, sl in self._for_each_leaf_slice(lo, hi):
+                dist = _slice_world_distance(leaf, sl, vs, self.origin_world, center)
+                sdf = dist - r_world
+                leaf.values[sl] = np.minimum(leaf.values[sl], sdf.astype(np.float32))
+                leaf.active[sl] |= np.abs(sdf) <= band_world
+        return self
+
+    def csg(self, other, op):
+        """CSG combination of two scalar SDF grids: `op` in 'union' | 'diff' | 'intersect'.
+
+        The result is stored in this grid. Where only one side has a leaf the other side reads as
+        its background (for level sets, "far outside"). Activity is union-ed except for 'intersect',
+        which intersects it.
+        """
+        if self.is_vec or other.is_vec:
+            raise TypeError("CSG is defined on scalar grids only")
+        if op not in ("union", "diff", "intersect"):
+            raise ValueError("op must be 'union', 'diff' or 'intersect'")
+        if not (np.allclose(self.voxel_size, other.voxel_size) and np.allclose(self.origin_world, other.origin_world)):
+            raise ValueError("CSG requires identical voxel grids (voxel_size and origin_world)")
+        for key in sorted(set(self._leaves) | set(other._leaves)):
+            theirs = other._leaves.get(key)
+            if theirs is None:
+                continue
+            mine = self._get_or_create_leaf(key)
+            if op == "union":
+                mine.values[...] = np.minimum(mine.values, theirs.values)
+                mine.active[...] |= theirs.active
+            elif op == "diff":
+                mine.values[...] = np.maximum(mine.values, -theirs.values)
+                mine.active[...] |= theirs.active
+            else:
+                mine.values[...] = np.maximum(mine.values, theirs.values)
+                mine.active[...] &= theirs.active
+        return self
+
+    def prune(self):
+        """Drop leaves with no active voxels; returns the number of leaves removed."""
+        dead = [key for key, leaf in self._leaves.items() if leaf.n_active == 0]
+        for key in dead:
+            del self._leaves[key]
+        return len(dead)
+
+    # ------------------------------------------------------------------ dense conversion
+
+    def _numpy_value_dtype(self):
+        return np.float64 if self.type_code == 1 else np.float32
+
+    def to_dense(self, bbox=None, pad=0):
+        """Dense `(x, y, z[, 3])` array covering `bbox` (default: the active bbox), plus `ijk_min`.
+
+        The background fills everything outside allocated leaves. This is the bridge back into the
+        engine's dense `qd.field` grids and renderers.
+        """
+        if bbox is None:
+            bbox = self.bbox()
+            if bbox is None:
+                shape = (1, 1, 1) + self.value_shape
+                return np.full(shape, self.background, dtype=self._numpy_value_dtype()), np.zeros(3, dtype=np.int64)
+        lo = np.asarray(bbox[0], dtype=np.int64) - pad
+        hi = np.asarray(bbox[1], dtype=np.int64) + pad
+        out = np.full(tuple(hi - lo + 1) + self.value_shape, self.background, dtype=self._numpy_value_dtype())
+        for leaf, src in self._for_each_leaf_slice(lo, hi, create=False):
+            leaf_lo = np.maximum(leaf.origin, lo) - lo
+            leaf_hi = np.minimum(leaf.origin + self.leaf_dim - 1, hi) - lo
+            dst = tuple(slice(leaf_lo[a], leaf_hi[a] + 1) for a in range(3))
+            out[dst] = leaf.values[src]
+        return out, lo
+
+    @classmethod
+    def from_dense(cls, values, origin=(0, 0, 0), voxel_size=(1.0, 1.0, 1.0), origin_world=(0.0, 0.0, 0.0),
+                   background=0.0, name="grid", grid_class="unknown", leaf_log2=DEFAULT_LEAF_LOG2,
+                   active=None):
+        """Build a sparse grid from a dense `(x, y, z)` or `(x, y, z, 3)` array.
+
+        Voxels equal to `background` stay inactive; pass a boolean `active` array to control the
+        mask instead. `origin` shifts the dense array's voxel (0,0,0) to that index. This is the
+        bridge from the engine's dense `qd.field` SDF and smoke grids into the sparse world.
+        """
+        values = np.asarray(values)
+        if values.ndim == 4 and values.shape[3] == 3:
+            grid = cls(dtype=np.dtype([("x", np.float32), ("y", np.float32), ("z", np.float32)]),
+                       background=background, voxel_size=voxel_size, origin_world=origin_world,
+                       leaf_log2=leaf_log2, name=name, grid_class=grid_class)
+            values = values.astype(np.float32, copy=False)
+        else:
+            if values.ndim != 3:
+                raise ValueError("dense values must be (x, y, z) or (x, y, z, 3)")
+            values = values.astype(np.float64 if values.dtype == np.float64 else np.float32, copy=False)
+            grid = cls(dtype=values.dtype, background=background, voxel_size=voxel_size,
+                       origin_world=origin_world, leaf_log2=leaf_log2, name=name, grid_class=grid_class)
+        if active is None:
+            if grid.is_vec:
+                active_mask = np.any(values != np.asarray(background).reshape(3), axis=-1)
+            else:
+                active_mask = values != float(background)
+        else:
+            active_mask = np.asarray(active, dtype=bool).reshape(values.shape[:3])
+
+        origin = np.asarray(origin, dtype=np.int64).reshape(3)
+        nx, ny, nz = values.shape[:3]
+        shape = np.array([nx, ny, nz])
+        for kx in range(int(origin[0]) >> leaf_log2, (int(origin[0]) + nx - 1 >> leaf_log2) + 1):
+            for ky in range(int(origin[1]) >> leaf_log2, (int(origin[1]) + ny - 1 >> leaf_log2) + 1):
+                for kz in range(int(origin[2]) >> leaf_log2, (int(origin[2]) + nz - 1 >> leaf_log2) + 1):
+                    block_lo = np.array([kx, ky, kz]) << leaf_log2
+                    data_lo = np.maximum(block_lo, origin)
+                    data_hi = np.minimum(block_lo + (1 << leaf_log2), origin + shape)
+                    src = tuple(slice(int(data_lo[a] - origin[a]), int(data_hi[a] - origin[a])) for a in range(3))
+                    if not active_mask[src].any():
+                        continue
+                    leaf = grid._get_or_create_leaf((kx, ky, kz))
+                    dst = tuple(slice(int(data_lo[a] - block_lo[a]), int(data_hi[a] - block_lo[a])) for a in range(3))
+                    leaf.values[dst] = values[src]
+                    leaf.active[dst] = active_mask[src]
+        return grid
+
+    # ------------------------------------------------------------------ transforms & sampling
+
+    def index_to_world(self, ijk):
+        return np.asarray(ijk, dtype=np.float64) * self.voxel_size + self.origin_world
+
+    def world_to_index(self, xyz):
+        return (np.asarray(xyz, dtype=np.float64) - self.origin_world) / self.voxel_size
+
+    def sample_nearest(self, xyz):
+        """Value at the voxel whose center is nearest to the world point."""
+        idx = np.rint(self.world_to_index(np.asarray(xyz, dtype=np.float64))).astype(np.int64).reshape(-1)
+        return self.get_value((int(idx[0]), int(idx[1]), int(idx[2])))
+
+    def sample_linear(self, xyz):
+        """Host-side trilinear sample at world coordinates (background outside data)."""
+        return _sample_linear(self, np.atleast_2d(np.asarray(xyz, dtype=np.float64)))[0]
+
+
+def _slice_world_distance(leaf, sl, voxel_size, origin_world, center):
+    """World-space euclidean distance from `center` to every voxel center in a leaf slice."""
+    axes = [leaf.origin[a] + np.arange(sl[a].start, sl[a].stop) for a in range(3)]
+    gx, gy, gz = np.meshgrid(*[axes[a] * voxel_size[a] + origin_world[a] for a in range(3)], indexing="ij")
+    return np.sqrt((gx - center[0]) ** 2 + (gy - center[1]) ** 2 + (gz - center[2]) ** 2)
+
+
+def _sample_linear(grid, points_world):
+    """Vectorized trilinear sampling of a scalar grid; one result per row of `points_world`."""
+    coords = (points_world - grid.origin_world) / grid.voxel_size
+    base = np.floor(coords).astype(np.int64)
+    frac = coords - base
+    out = np.zeros(len(points_world), dtype=grid._numpy_value_dtype())
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                ijk = base + np.array([dx, dy, dz])
+                w = ((frac[:, 0] if dx else 1.0 - frac[:, 0])
+                     * (frac[:, 1] if dy else 1.0 - frac[:, 1])
+                     * (frac[:, 2] if dz else 1.0 - frac[:, 2]))
+                vals = np.array([grid.get_value((int(i[0]), int(i[1]), int(i[2]))) for i in ijk], dtype=np.float64)
+                out += (vals * w).astype(out.dtype)
+    return out

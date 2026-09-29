@@ -1,0 +1,187 @@
+# XUVDB 太虚 — genesis 自研稀疏体素格式（可编辑 · 与 OpenVDB 互转）
+
+> 「不游乎太虚。」——《庄子·知北游》
+> 「太虚无形，气之本体。」——张载《正蒙·太和》
+
+`xuvdb` 取「太虚」之音：这是中文里对 VDB「无界而稀疏的索引域」最准确的翻译——无界
+（root 哈希域不设上限），无形（未分配的空间没有形态，采样即得背景值）。
+
+`genesis.xuvdb` 基于 quadrants 内核：**自己的 `.xuvdb` 格式**（可修改、可在内核里写值），
+以及**与 OpenVDB 的双向互转**（原生 `.vdb` 文件读写，无需安装 OpenVDB；有 `pyopenvdb`
+绑定时还能内存级互转）。
+
+## 命名规范（三层名字，各归其位）
+
+| 层 | 名字 | 规则 |
+|---|---|---|
+| 项目名 | `xuvdb` | 拼音；不用 Open 前缀（ASWF 语境下暗示基金会血统） |
+| 命名空间 / 扩展名 | `genesis.xuvdb` / `.xuvdb` | API 标识符一律英文：`xuvdb.prune()`、`xuvdb.VdbGrid`，绝不是 `xuvdb.sunyi()`。道家词只活在概念层（文档题词、日志、可视化标签） |
+| 互转文件 | `.vdb` | **自有格式绝不写 `.vdb` 后缀**（Houdini／Blender／Cycles／Arnold 按扩展名当 OpenVDB 解析，格式不符时静默出错或崩溃，极难定位；`save()` 对 `.vdb` 路径直接拒绝）。要互通就单独导出：`write_vdb()` 产出真正的 OpenVDB 流 |
+
+## 为什么是它
+
+|  | OpenVDB | NanoVDB | XUVDB |
+|---|---|---|---|
+| 结构 | 5 层 B+树，CPU C++ | 同构只读缓冲，GPU | 两级：dict 叶根 + 稠密叶块 |
+| 可修改 | ✅（CPU） | ❌ GPU 只读 | ✅ Python 端任意结构编辑；**内核端可写值** |
+| 可微分包差 | ❌ | ❌ | 值缓冲可被 quadrants 内核读写（拓扑固定） |
+| Python 依赖 | pyopenvdb（需自行构建） | — | 仅 numpy + quadrants |
+
+定位不是替换任何求解器，而是补齐 README 物理栈背后的**空间表示层**（落点见下文）。
+
+## 安装
+
+独立 Python 包（src 布局，`import xuvdb` 即用）：
+
+```bash
+uv pip install .            # 或 pip install .
+uv pip install -e ".[test]" # 开发模式 + pytest
+```
+
+可选 extras：`[genesis]`（引擎集成 genesis-world）、`[openvdb]`（pyopenvdb 内存级互转）。
+与 genesis 引擎同仓部署时，把 `src/xuvdb/` 挂为引擎包内的 `genesis/xuvdb/` 子模块，
+`import genesis.xuvdb` 与 `import xuvdb` 完全等价（两者不要在同进程混用：会得到两份模块实例）。
+
+## 快速上手
+
+```python
+import numpy as np
+import genesis.xuvdb as xuvdb
+
+# 1) 编辑：窄带 level set 球（体素 0.05，带宽 3 体素）
+grid = xuvdb.VdbGrid(background=3 * 0.05, voxel_size=0.05, leaf_log2=4,
+                     name="shield", grid_class="level set")
+grid.stamp_sphere((0.3, 0.2, 0.1), radius=0.25, band=3.0)
+grid.stamp_sphere((0.5, 0.2, 0.1), radius=0.10)          # CSG：并入第二个球
+grid.fill_box((-2, -2, -2), (2, 2, 2), value=0.0)         # 任意稠密填充（示例）
+grid.prune()
+
+# 2) 自有格式落盘 / 读回（多网格、f32/f64/vec3）
+xuvdb.save("scene.xuvdb", [grid])
+grids = xuvdb.load("scene.xuvdb")
+
+# 3) 与 OpenVDB 互通（显式导出：真正的 OpenVDB 流，Houdini/Blender 直接打开）
+xuvdb.write_vdb("scene.vdb", [grid])
+back = xuvdb.read_vdb("scene.vdb", grid_name="shield")
+
+# 4) 内核采样 / 写值（等同 Warp example_nvdb 的用法，但值可写）
+vol = xuvdb.GpuVolume(grid)
+pts = np.array([[0.3, 0.2, 0.36]], dtype=np.float32)
+d = vol.sample(pts, linear=True)          # SDF 距离
+n = vol.sdf_normal(pts)                   # 有限差分表面法向
+vol.write_voxels(pts, np.array([-0.01], np.float32)); vol.sync_to_host()
+
+# 5) 粒子 ⇄ 体积（液体/油，见落点④）
+drops = np.array([[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]])
+fog = xuvdb.VdbGrid(voxel_size=0.05, name="liquid", grid_class="fog volume")
+fog.scatter_particles(drops, h=4 * 0.05, weights=1.0)     # SPH cubic 核密度 splat
+surf = xuvdb.VdbGrid(background=3 * 0.05, voxel_size=0.05, grid_class="level set")
+surf.union_spheres(drops, radius=0.03)                    # particle level set 表面代理
+
+# 6) DDA 射线（空叶块按块跳过，交叉点二分细化到亚体素）
+t, point, value = xuvdb.ray_surface_hit(grid, (0.3, 0.2, 2.0), (0, 0, -1))
+```
+
+与引擎稠密场的桥：
+
+```python
+# 稠密 qd.field / numpy SDF（如 rigid geom 的 sdf_val）→ 稀疏
+sparse = xuvdb.VdbGrid.from_dense(dense_sdf, origin=ijk_min, voxel_size=h,
+                                  background=band_h, grid_class="level set")
+dense, ijk_min = sparse.to_dense()        # 反向：渲染器 / 求解器输入
+```
+
+## 格式
+
+### `.xuvdb`（自有格式，小端）
+
+```
+"XUVDB" | u8 version=1 | u8 flags | u16 n_grids
+per grid:
+  str name | u8 type(0=f32,1=f64,2=vec3f) | u8 leaf_log2 | u8 class | u8 rsv
+  f64[3] voxel_size | f64[3] origin_world | background
+  u32 n_leaves
+  per leaf（按叶原点排序）: i32[3] origin | u64[dim³/64] active mask | 值稠密数组
+```
+
+- 叶内线性序 `n = x·dim² + y·dim + z`（z 最快），**与 OpenVDB leaf 序一致**，互转零转置。
+- 叶块与 OpenVDB LeafNode 同为稠密缓冲：level set 内部体素的 `-background` 值在
+  save/load 后保留。
+- 变换约定与 OpenVDB 线性映射一致：`world = index · voxel_size + origin_world`，
+  体素中心在整数索引处。
+
+### `.vdb`（OpenVDB 官方流格式，仅显式导出用）
+
+字节布局逐一对照 OpenVDB 源码实现（`io/Archive.cc`、`GridDescriptor.cc`、`Compression.h`、
+`tree/*.h`、`math/Maps.h`、`Metadata.h`）：
+
+- 头 57B：`int64 magic 0x56444220`、u32 文件版本、u32 库主/次版本、u8 offsets 标志、36 字符 UUID；
+- 文件级元数据表 → i32 网格数 → **描述符与网格流交错**（描述符、i64×3 偏移、网格流、下一描述符…）；
+- 网格流：u32 压缩标志 → 元数据表（name/class/file_* 统计）→ 变换（ScaleTranslate 家族
+  = 类型字符串 + 6×Vec3d）→ 树（`i32 buffer_count`、root 背景 + tiles + 子节点）；
+- 树：root → InternalNode(5)（32³ 桌、512×u64 双掩码、值表）→ InternalNode(4)（64 项）→
+  LeafNode(8³)（拓扑段只有值掩码，origin 由树路径隐含；缓冲段掩码重写一遍 + 值块）；
+- 值块：`io::writeCompressedValues` 语义 —— 1 字节 metadata（0=惰性值全为 +bg、1=-bg、
+  2/4/5=带 1~2 个惰性值/选择掩码、6=全量数组）+ 值（按 ACTIVE_MASK 只存 active）。
+
+写侧：文件版本 224、压缩 = `COMPRESS_ACTIVE_MASK`（无 zip/blosc），任何 OpenVDB ≥ 9 可读。
+读侧：支持 `COMPRESS_NONE` / `COMPRESS_ZIP`（stdlib zlib）/ `COMPRESS_ACTIVE_MASK` /
+`_HalfFloat` 网格；Blosc 抛出明确错误；root/internode 活动 tile 物化为稠密叶
+（受 `max_tile_voxels` 上限保护）。
+
+## 已知边界
+
+- `GpuVolume` 只支持 f32 标量网格；写入只改值不改拓扑、不动 active 掩码（掩码是宿主侧
+  状态）。结构性编辑后需重新打包。
+- `scatter_particles`／`union_spheres` 是 Python 循环 + 叶切片向量化：千级粒子适用，
+  大规模生产需按叶批处理（未做）。`union_spheres` 的 min-of-spheres 距离在重叠粒子间
+  的凹桥区是真实距离的上界（Lipschitz 精确），做碰撞/渲染代理足够，精确表面请离线
+  用正规表面重建精修。
+- `.vdb` 读侧不支持：Blosc 压缩、实例化网格（instance parent）、点云网格（PointDataGrid）、
+  `5_4_3` 以外的树形。写侧不产生 root tile（全部以叶表达）。
+- 与求解器自动微分的边界：XUVDB 提供的是**采样/写入原语**；把 VDB 值直接接入反传图需要
+  包一层自定义求导规则（这正是 FastSweeping 等算子不可微的同一边界）。
+
+## 与引擎四个落点的对接
+
+对应《Genesis × OpenVDB 重合度报告》（`genesis_openvdb_overlap.html`）的结论：
+
+1. **刚性 SDF（`utils/sdf.py`，风险最低）**：`geom.sdf_val` 稠密体 → `VdbGrid.from_dense`
+   窄带化 → `GpuVolume.sample/sdf_normal` 做内核内碰撞采样；粗块最小值下界的带宽门控
+   对应这里"空叶块直接跳过"——稀疏性免费获得。维护/雕刻工装（`csg` + `stamp_sphere`）
+   可离线改碰撞体。
+2. **MPM 背景网格（解除 1e9 上限）**：`use_sparse_grid` 被移除的原因在 GPU 端动态拓扑；
+   XUVDB 的分工是"拓扑宿主端冻结 + 值内核端可写"。粒子覆盖块用 `fill_box` 声明、每步
+   `write_voxels` 回写网格值，是向稀疏 MPM 过渡的最小代价路径（需自行验证与现有
+   dense reset 的性能对比）。
+3. **烟尘 / 稳定流体（收益上限最高）**：压力投影每帧回写全网格，短期不建议动求解器；
+   现实路径是**出口侧**：每 N 步 `from_dense(density_field)` → `write_vdb` 交给
+   Houdini/Blender 体渲染；进口侧用 Houdini 烘的 `.vdb` 作初始条件（`read_vdb` →
+   `to_dense`）。
+4. **液体与油（SPH，粒子 ⇄ 体积）**：Genesis 的液体是 Lagrangian SPH（hash grid 邻域，
+   VDB 不做邻居搜索），与稀疏体积的接口在两端——
+   - **出口（每步/每 N 步）**：`scatter_particles(pos, h, mass)` 把粒子 splat 成密度
+     fog 网格（SPH cubic 核、单位积分，质量守恒已测）→ `write_vdb` 给 Houdini/Blender
+     体渲染液体，比逐粒子渲染便宜得多；要表面就 `union_spheres(pos, r, band)` 出
+     particle level set 表面代理（喷雾/液滴场景），离线可用 OpenVDB 生态精修。
+   - **进口**：Houdini 烘的液面/容器 `.vdb` level set → `read_vdb` → `GpuVolume.sample`
+     做容器碰撞 SDF 或装液初始条件（与落点①同一套采样机制，SPH 边界碰撞即刚体 SDF
+     碰撞的复用）。
+   - **油（高黏/两相）**：黏性在 SPH 求解器侧，体积层只管表征——两相液体（油-水、
+     油-气）每相一个 fog 网格，即混合分数场 α：`scatter_particles` 按相内粒子各 splat
+     一份，导出双网格 `.vdb`，渲染端做 α 混合；界面 SDF 用两相 `union_spheres` 之差
+     （`csg 'diff'`）。
+   - **在线更新**：`GpuVolume.write_voxels` 可增量回写密度值做实时可视化；拓扑（叶
+     集合）按粒子包围盒周期性重打包（拓扑宿主端冻结的同一分工）。
+
+## 测试
+
+```
+pytest tests/ -q
+```
+
+覆盖：树编辑/CSG/稠密互转、粒子 splat（质量守恒、可加性、vec3 速度场、双核函数）、
+`union_spheres`（表面/窄带/逐粒子半径/射线命中/与 stamp 复合）、`.xuvdb` 多网格多类型
+往返、`.vdb` 头部字节与偏移校验、f32/f64/vec3/fog/level-set 往返、多叶尺寸重分块、
+负坐标、惰性值压缩路径、`save()` 拒绝 `.vdb` 后缀、GPU 采样对齐宿主三线性、内核写值
+往返、DDA 射线（含空块跳跃、内部出发、tmax 截断、变换偏移）。

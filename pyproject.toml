@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xuvdb"
+description = "Editable sparse voxel volumes with OpenVDB interop, built on quadrants kernels"
+readme = "README.md"
+dynamic = ["version"]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "numpy",
+    "quadrants",
+]
+
+[project.optional-dependencies]
+# engine integration (import genesis.xuvdb alongside a working genesis install)
+genesis = ["genesis-world"]
+# in-memory OpenVDB bridge (to_openvdb / from_openvdb) via the official bindings
+openvdb = ["pyopenvdb"]
+test = ["pytest"]
+
+[tool.setuptools.dynamic]
+version = { attr = "xuvdb.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
