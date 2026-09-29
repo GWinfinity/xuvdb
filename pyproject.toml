@@ -34,6 +34,7 @@ classifiers = [
 [project.urls]
 Homepage = "https://atomgit.com/allan_/xuvdb"
 Repository = "https://atomgit.com/allan_/xuvdb"
+GitHub = "https://github.com/GWinfinity/xuvdb"
 Issues = "https://atomgit.com/allan_/xuvdb/issues"
 Roadmap = "https://atomgit.com/allan_/xuvdb/blob/main/ROADMAP.md"
 Benchmarks = "https://atomgit.com/allan_/xuvdb/blob/main/BENCHMARKS.md"

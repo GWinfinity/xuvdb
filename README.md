@@ -1,5 +1,8 @@
 # XUVDB 太虚 — 基于 quadrants 的稀疏体素格式（可编辑 · 与 OpenVDB 互转）
 
+仓库:[AtomGit](https://atomgit.com/allan_/xuvdb)(主) · [GitHub 镜像](https://github.com/GWinfinity/xuvdb) ·
+[PyPI](https://pypi.org/project/xuvdb/) · [性能基线](https://github.com/GWinfinity/xuvdb/blob/main/BENCHMARKS.md)
+
 > 「不游乎太虚。」——《庄子·知北游》
 > 「太虚无形，气之本体。」——张载《正蒙·太和》
 
