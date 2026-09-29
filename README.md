@@ -173,6 +173,10 @@ per grid:
    - **在线更新**：`GpuVolume.write_voxels` 可增量回写密度值做实时可视化；拓扑（叶
      集合）按粒子包围盒周期性重打包（拓扑宿主端冻结的同一分工）。
 
+## 许可证
+
+Apache-2.0（与上游 quadrants、genesis-world 一致），见 [LICENSE](LICENSE)。
+
 ## 测试
 
 ```

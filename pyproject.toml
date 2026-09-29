@@ -8,6 +8,8 @@ description = "Editable sparse voxel volumes with OpenVDB interop, built on quad
 readme = "README.md"
 dynamic = ["version"]
 requires-python = ">=3.10,<3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
     "numpy",
     "quadrants",
