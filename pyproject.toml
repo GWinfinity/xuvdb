@@ -12,6 +12,10 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "xuvdb contributors" }]
 keywords = ["sparse-volumes", "voxel", "openvdb", "nanovdb", "sdf", "physics-simulation", "quadrants"]
+dependencies = [
+    "numpy",
+    "quadrants",
+]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
@@ -33,10 +37,6 @@ Repository = "https://atomgit.com/allan_/xuvdb"
 Issues = "https://atomgit.com/allan_/xuvdb/issues"
 Changelog = "https://atomgit.com/allan_/xuvdb/blob/main/ROADMAP.md"
 Benchmarks = "https://atomgit.com/allan_/xuvdb/blob/main/BENCHMARKS.md"
-dependencies = [
-    "numpy",
-    "quadrants",
-]
 
 [project.optional-dependencies]
 # engine-side example (examples/test_packages.py) drives a genesis-world simulation
