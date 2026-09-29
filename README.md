@@ -27,7 +27,7 @@
 | 可微分包差 | ❌ | ❌ | 值缓冲可被 quadrants 内核读写（拓扑固定） |
 | Python 依赖 | pyopenvdb（需自行构建） | — | 仅 numpy + quadrants |
 
-定位不是替换任何求解器，而是补齐 README 物理栈背后的**空间表示层**（落点见下文）。
+定位不是替换任何求解器，而是补一个**可编辑的稀疏空间表示层**。
 
 ## 安装
 
@@ -70,7 +70,7 @@ d = vol.sample(pts, linear=True)          # SDF 距离
 n = vol.sdf_normal(pts)                   # 有限差分表面法向
 vol.write_voxels(pts, np.array([-0.01], np.float32)); vol.sync_to_host()
 
-# 5) 粒子 ⇄ 体积（液体/油，见落点④）
+# 5) 粒子 ⇄ 体积（液体/油）
 drops = np.array([[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]])
 fog = xuvdb.VdbGrid(voxel_size=0.05, name="liquid", grid_class="fog volume")
 fog.scatter_particles(drops, h=4 * 0.05, weights=1.0)     # SPH cubic 核密度 splat
@@ -81,10 +81,10 @@ surf.union_spheres(drops, radius=0.03)                    # particle level set �
 t, point, value = xuvdb.ray_surface_hit(grid, (0.3, 0.2, 2.0), (0, 0, -1))
 ```
 
-与引擎稠密场的桥：
+稠密场 ⇄ 稀疏网格：
 
 ```python
-# 稠密 qd.field / numpy SDF（如 rigid geom 的 sdf_val）→ 稀疏
+# 稠密 numpy SDF → 稀疏
 sparse = xuvdb.VdbGrid.from_dense(dense_sdf, origin=ijk_min, voxel_size=h,
                                   background=band_h, grid_class="level set")
 dense, ijk_min = sparse.to_dense()        # 反向：渲染器 / 求解器输入
@@ -140,38 +140,6 @@ per grid:
   `5_4_3` 以外的树形。写侧不产生 root tile（全部以叶表达）。
 - 与求解器自动微分的边界：XUVDB 提供的是**采样/写入原语**；把 VDB 值直接接入反传图需要
   包一层自定义求导规则（这正是 FastSweeping 等算子不可微的同一边界）。
-
-## 与引擎四个落点的对接
-
-对应《Genesis × OpenVDB 重合度报告》（`genesis_openvdb_overlap.html`）的结论：
-
-1. **刚性 SDF（`utils/sdf.py`，风险最低）**：`geom.sdf_val` 稠密体 → `VdbGrid.from_dense`
-   窄带化 → `GpuVolume.sample/sdf_normal` 做内核内碰撞采样；粗块最小值下界的带宽门控
-   对应这里"空叶块直接跳过"——稀疏性免费获得。维护/雕刻工装（`csg` + `stamp_sphere`）
-   可离线改碰撞体。
-2. **MPM 背景网格（解除 1e9 上限）**：`use_sparse_grid` 被移除的原因在 GPU 端动态拓扑；
-   XUVDB 的分工是"拓扑宿主端冻结 + 值内核端可写"。粒子覆盖块用 `fill_box` 声明、每步
-   `write_voxels` 回写网格值，是向稀疏 MPM 过渡的最小代价路径（需自行验证与现有
-   dense reset 的性能对比）。
-3. **烟尘 / 稳定流体（收益上限最高）**：压力投影每帧回写全网格，短期不建议动求解器；
-   现实路径是**出口侧**：每 N 步 `from_dense(density_field)` → `write_vdb` 交给
-   Houdini/Blender 体渲染；进口侧用 Houdini 烘的 `.vdb` 作初始条件（`read_vdb` →
-   `to_dense`）。
-4. **液体与油（SPH，粒子 ⇄ 体积）**：Genesis 的液体是 Lagrangian SPH（hash grid 邻域，
-   VDB 不做邻居搜索），与稀疏体积的接口在两端——
-   - **出口（每步/每 N 步）**：`scatter_particles(pos, h, mass)` 把粒子 splat 成密度
-     fog 网格（SPH cubic 核、单位积分，质量守恒已测）→ `write_vdb` 给 Houdini/Blender
-     体渲染液体，比逐粒子渲染便宜得多；要表面就 `union_spheres(pos, r, band)` 出
-     particle level set 表面代理（喷雾/液滴场景），离线可用 OpenVDB 生态精修。
-   - **进口**：Houdini 烘的液面/容器 `.vdb` level set → `read_vdb` → `GpuVolume.sample`
-     做容器碰撞 SDF 或装液初始条件（与落点①同一套采样机制，SPH 边界碰撞即刚体 SDF
-     碰撞的复用）。
-   - **油（高黏/两相）**：黏性在 SPH 求解器侧，体积层只管表征——两相液体（油-水、
-     油-气）每相一个 fog 网格，即混合分数场 α：`scatter_particles` 按相内粒子各 splat
-     一份，导出双网格 `.vdb`，渲染端做 α 混合；界面 SDF 用两相 `union_spheres` 之差
-     （`csg 'diff'`）。
-   - **在线更新**：`GpuVolume.write_voxels` 可增量回写密度值做实时可视化；拓扑（叶
-     集合）按粒子包围盒周期性重打包（拓扑宿主端冻结的同一分工）。
 
 ## 许可证
 
