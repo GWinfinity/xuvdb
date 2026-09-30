@@ -79,7 +79,7 @@ GRID_METHODS = [
 def test_public_api_frozen():
     major = int(xuvdb.__version__.split(".")[0])
     assert major == 1  # semver: breaking changes bump the major
-    assert xio.VERSION == 2  # .xuvdb format v2 is frozen; readers keep v1 forever
+    assert xio.VERSION == 3  # .xuvdb format v3 is frozen; readers keep v1/v2 forever
     for name in PUBLIC_API:
         assert hasattr(xuvdb, name), name
     for name in GRID_METHODS:

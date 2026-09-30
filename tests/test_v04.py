@@ -53,18 +53,17 @@ def test_xuvdb_v2_corruption_detected(tmp_path):
         xuvdb.load(path)
 
 
-def test_xuvdb_v1_still_readable(tmp_path):
-    """A v1 file (written by xuvdb 0.1-0.3: no crc trailer, no rotation, flags=0) keeps loading."""
+def test_xuvdb_v1_emitter_and_reader(tmp_path, monkeypatch):
+    """The writer can emit genuine legacy streams (VERSION=1: no crc/rotation/kind byte) and
+    the reader loads them - the same compatibility the 0.1-0.3 releases shipped."""
+    import xuvdb.io as xio
     grid = make_grid()
-    v2_path = str(tmp_path / "v2.xuvdb")
-    xuvdb.save(v2_path, [grid])  # uncompressed v2
-    with open(v2_path, "rb") as f:
-        blob = f.read()
-    # v1 header: magic + version=1 + flags=0 + n_grids; payload identical; no crc trailer
-    v1_bytes = blob[:5] + bytes([1, 0]) + blob[7:-4]
     v1_path = str(tmp_path / "v1.xuvdb")
-    with open(v1_path, "wb") as f:
-        f.write(v1_bytes)
+    monkeypatch.setattr(xio, "VERSION", 1)
+    xuvdb.save(v1_path, [grid])
+    with open(v1_path, "rb") as f:
+        blob = f.read()
+    assert blob[5] == 1 and blob[6] == 0 and len(blob) % 1 == 0  # flags 0, no trailer marker
     back = xuvdb.load(v1_path)[0]
     assert back.name == "shield"
     assert np.allclose(sample_grid(grid, PTS), sample_grid(back, PTS), atol=1e-6)

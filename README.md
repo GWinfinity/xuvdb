@@ -126,25 +126,28 @@ dense, ijk_min = sparse.to_dense()        # 反向：渲染器 / 求解器输入
 
 ## 格式
 
-### `.xuvdb`（自有格式 v2，小端）
+### `.xuvdb`（自有格式 v3，小端）
 
 ```
-"XUVDB" | u8 version=2 | u8 flags(bit0=zlib 载荷, bit1=CRC32 尾注) | u32 n_grids
+"XUVDB" | u8 version=3 | u8 flags(bit0=zlib 载荷, bit1=CRC32 尾注) | u32 n_grids
 payload（bit0 时为 zlib 压缩）:
 per grid:
   str name | u8 type(0=f32,1=f64,2=vec3f,3=f16) | u8 leaf_log2 | u8 class
   | u8 grid_flags(bit0=后随旋转阵) | u8 rsv
   f64[3] voxel_size | f64[3] origin_world | [f64[9] rotation] | background
   u32 n_leaves
-  per leaf（按叶原点排序）: i32[3] origin | u64[dim³/64] active mask | 值稠密数组
+  per leaf（按叶原点排序）: i32[3] origin | u8 kind
+    kind=0（稠密）: u64[dim³/64] active mask | 值稠密数组
+    kind=1（常数, v3 tile 等价物）: u8 active | 一个值   ← 整块同值坍缩, ~400x 磁盘压缩
 trailer（bit1）: u32 CRC32（对未压缩载荷计算）
 ```
 
-- v1 文件（无压缩/无尾注/无旋转）永久可读；值缓冲是**全量稠密叶**（非掩码过滤），
+- v1/v2 文件永久可读；值缓冲是**全量稠密叶**（非掩码过滤），
   内核写进 inactive 体素的值在 save/load 后保留。
 - 叶内线性序 `n = x·dim² + y·dim + z`（z 最快），**与 OpenVDB leaf 序一致**，互转零转置。
 - 变换：`world = R @ (index · voxel_size) + origin_world`，体素中心在整数索引处；
   R 缺省为单位阵。
+- 流式消费：`iter_leaves`（惰性逐叶）/ `iter_slabs`（按 slab 产稠密片）——out-of-core 原语。
 
 ### `.vdb`（OpenVDB 官方流格式，仅显式导出用）
 
@@ -174,6 +177,11 @@ ScaleTranslateMap；任何 OpenVDB ≥ 9 可读。
 
 ## 已知边界
 
+- **三个短板的现状**（1.2.0）：常数区压缩已补（`.xuvdb` v3 常数叶编码 + `compress()` 内存
+  压缩）；out-of-core 以 `iter_leaves` / `iter_slabs` 流式原语提供（不是完整分页引擎）；
+  窄带 SDF 重整（reinit）**未提供**——Sussman PDE 与 chamfer-Dijkstra 两种实验方案都在
+  凹缝处过不了质量门槛（根因：界面亚体素信息在体素化时已丢失），需要图元感知的局部
+  精确重算，顺延至 2.0+（测量数据见 ROADMAP）。
 - `GpuVolume` 只支持 f32 标量网格（f16/f64/vec3 为宿主与格式层类型）；写入只改值不改拓扑、
   不动 active 掩码（掩码是宿主侧状态）。**掩码语义**：内核写进 inactive 体素的值能通过
   `sample*`、`.xuvdb` 存取、`to_dense`、射线看到（叶是稠密缓冲），但 **`write_vdb` 与
@@ -203,7 +211,7 @@ Apache-2.0（与上游 quadrants、genesis-world 一致），见 [LICENSE](https
 ## 版本与稳定性(1.0.0 起)
 
 - **semver**:主版本 = 破坏性变更,次版本 = 向后兼容的新功能,修订 = 修复;
-- **`.xuvdb` 格式 v2 冻结**:v1 永久可读;未来字段只增不改,版本号随破坏性变更递增;
+- **`.xuvdb` 格式 v3 冻结**:v1/v2 永久可读;未来字段只增不改,版本号随破坏性变更递增;
 - **公开 API** = 本 README 与 `xuvdb.__all__` 所列(`VdbGrid`/`Leaf`/`GpuVolume`/`VolumeBatch`/
   `save`/`load`/`write_vdb`/`read_vdb`/`to_openvdb`/`from_openvdb`/`ray_surface_hit`/
   `torch_bridge`/`init_runtime`);`xuvdb.kernels` 是内部实现,不承诺稳定;

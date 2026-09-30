@@ -496,6 +496,27 @@ class VdbGrid:
             del self._leaves[key]
         return len(dead)
 
+    def compress(self):
+        """Reset inactive voxels to background, then prune: the RAM-level constant-region pass.
+
+        Far-field junk (e.g. exact distances stamped into inactive voxels) is what keeps
+        mostly-empty leaves alive; this normalizes it away so `prune` can drop every
+        fully-background leaf. Lossy by design for inactive values - call `sample*` first if
+        you need them. Returns (leaves_dropped, voxels_reset).
+        """
+        if self.is_vec:
+            bg = np.asarray(self.background).reshape(3)
+        else:
+            bg = float(self.background)
+        reset = 0
+        for leaf in self._leaves.values():
+            dead = ~leaf.active
+            if leaf.values[dead].size and np.any(leaf.values[dead] != bg):
+                leaf.values[dead] = bg
+                reset += int(np.count_nonzero(dead))
+            leaf.invalidate()
+        return self.prune(), reset
+
     # ------------------------------------------------------------------ dense conversion
 
     def _numpy_value_dtype(self):
