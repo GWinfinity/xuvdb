@@ -19,3 +19,8 @@ demo_output/
 # root-level debug artifacts from ad-hoc runs
 /*.vdb
 /*.xuvdb
+
+# local tooling / ad-hoc profiling
+.codegraph/
+/_debug_mesh.py
+/_prof.py

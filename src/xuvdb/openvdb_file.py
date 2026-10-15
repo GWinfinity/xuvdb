@@ -239,6 +239,34 @@ def write_vdb(path, grids, blosc=False):
     return len(s.buf)
 
 
+_RESERVED_META_KEYS = {"name", "class", "file_compression", "file_bbox_min", "file_bbox_max",
+                       "file_voxel_count"}
+
+
+def _encode_user_metadata(metadata):
+    """`(type_name, payload)` pairs for a grid's user metadata dict (OpenVDB MetaMap entries)."""
+    out = []
+    for key, value in (metadata or {}).items():
+        key = str(key)
+        if key in _RESERVED_META_KEYS:
+            raise ValueError(f"metadata key {key!r} is reserved (written by the serializer)")
+        if isinstance(value, str):
+            out.append((key, "string", value.encode("utf-8")))
+        elif isinstance(value, bool):
+            out.append((key, "bool", struct.pack("<?", value)))
+        elif isinstance(value, int):
+            out.append((key, "int64_t", struct.pack("<q", value)))
+        elif isinstance(value, float):
+            out.append((key, "double", struct.pack("<d", value)))
+        elif isinstance(value, np.ndarray) and value.shape == (3,) and value.dtype.kind == "f":
+            out.append((key, "vec3d", value.astype("<f8").tobytes()))
+        else:
+            raise TypeError(
+                f"metadata value for {key!r} has unsupported type {type(value).__name__}; "
+                "use str, bool, int, float or a float (3,) array")
+    return out
+
+
 def _write_grid_stream(s, grid, use_blosc=False):
     """Emit one grid's metadata, transform, topology and buffers; returns the block (buffers) offset."""
     s.u32(COMPRESS_ACTIVE_MASK | (COMPRESS_BLOSC if use_blosc else 0))
@@ -250,6 +278,7 @@ def _write_grid_stream(s, grid, use_blosc=False):
             ("file_bbox_min", "vec3i", struct.pack("<3i", *bbox[0]) if bbox is not None else struct.pack("<3i", 0, 0, 0)),
             ("file_bbox_max", "vec3i", struct.pack("<3i", *bbox[1]) if bbox is not None else struct.pack("<3i", -1, -1, -1)),
             ("file_voxel_count", "int64_t", struct.pack("<q", grid.active_voxel_count))]
+    meta.extend(_encode_user_metadata(getattr(grid, "metadata", None)))
     s.u32(len(meta))
     for name, type_name, payload in meta:
         s.string(name)
@@ -533,9 +562,10 @@ def _read_grid_stream(s, name, grid_type, from_half, leaf_log2, max_tile_voxels)
     grid_class = meta.get("class", "unknown")
     if grid_class not in GRID_CLASSES:
         grid_class = "unknown"
+    user_meta = {k: v for k, v in meta.items() if k not in _RESERVED_META_KEYS}
     grid = VdbGrid(dtype=dtype, background=background, voxel_size=voxel_size, origin_world=origin_world,
                    leaf_log2=leaf_log2, name=meta.get("name", name), grid_class=grid_class,
-                   rotation=rotation)
+                   rotation=rotation, metadata=user_meta)
 
     n_tiles = s.u32()
     n_int5 = s.u32()

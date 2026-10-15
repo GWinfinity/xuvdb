@@ -97,6 +97,7 @@ class VdbGrid:
         name="grid",
         grid_class="unknown",
         rotation=None,
+        metadata=None,
     ):
         dtype = np.dtype(dtype)
         if dtype == np.float32:
@@ -140,6 +141,7 @@ class VdbGrid:
             raise ValueError(f"unsupported grid_class: {grid_class!r}; use one of {GRID_CLASSES}")
         self.grid_class = grid_class
         self._leaves = {}
+        self.metadata = dict(metadata) if metadata else {}
 
     @staticmethod
     def is_vec_shape(value_shape):
@@ -252,6 +254,7 @@ class VdbGrid:
             name=self.name,
             grid_class=self.grid_class,
             rotation=self.rotation,
+            metadata=self.metadata,
         )
         for key, leaf in self._leaves.items():
             new = Leaf(leaf.origin, leaf.dim, self.value_shape, self.background)
