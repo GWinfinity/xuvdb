@@ -70,6 +70,20 @@ OpenVDB 流"。
 
 依赖面变化从 v0.4 起须在 changelog 显式声明(blosc 依赖、torch extra)。
 
+## v1.3 — 表面算子(marching cubes / offset / mesh→SDF / metadata) ✅ 1.3.0
+
+- [x] `level_set_to_mesh`:marching cubes(256 情形查找表,向量化逐叶推进,跨立方体棱边
+  去重 + 等值点精确过角时的顶点焊接);单位球体积误差 0.095%,法向 100% 朝外,
+  23k 三角 0.24s;
+- [x] `mesh_to_level_set` / `dilated_mesh_shell`:三角形网格 → 窄带 level set
+  (分块点到三角形精确距离 + 候选对收集向量化;+X 射线奇偶符号;bin 空间哈希加速);
+- [x] `offset`:窄带 upwind(Godunov)等距偏移,OpenVDB `LevelSetFilter::offset` 的语义
+  等价物;符号约定正值外扩。±0.1 偏移实测误差 0.25~0.31 体素。**精度依赖 reinit 的
+  缺席仍是边界**:反复大偏移会偏离真距离场(与上游 OpenVDB 版同契约,文档化);
+- [x] `.vdb` grid metadata 往返:`grid.metadata` dict(string/bool/int/float/vec3d),
+  保留键(name/class/file_*)拒绝写入;
+- [x] `requires-python` 放宽至 <3.15(3.14 就绪;cp314t 还受 quadrants wheel 制约)。
+
 ## v1.2 — 三短板(常数区压缩 / 流式 / reinit) ✅ 1.2.0(reinit 顺延)
 
 - [x] 常数区压缩(OpenVDB tile 的叶级等价):`.xuvdb` v3 常数叶编码,整叶同值坍缩为
@@ -82,3 +96,18 @@ OpenVDB 流"。
   chamfer-Dijkstra 方案在凹缝处比 min-of-SDF 原场更差((9,4,2) 处 −0.10 → −0.15,真值
   ≈ −0.04;根因:界面亚体素信息在体素化时已丢失,网格重整法的固有边界)。正确方案
   需要图元感知的局部精确重算,属 2.0+ 的设计变更。测量数据在 1.2.0 开发提交中。
+
+## v1.3.1 — 平滑算子 smooth ✅ 1.3.1
+
+- [x] `smooth(grid, iterations, alpha)`:OpenVDB `LevelSetFilter::smooth` 的等价物——
+  窄带 SDF 值的离散 Laplacian Jacobi 松弛(``phi <- phi + alpha*(邻域均值-phi)``,
+  0 < alpha <= 1 凸组合无条件稳定)。只在活动 bbox 内松弛,盒外体素/halo/远场
+  Dirichlet 冻结 ⇒ 多次调用与单次多迭代严格等价(链式调用只受 float32 写回
+  舍入影响);active 掩码、叶结构、band 宽度全部不动,无重打带、无拓扑变化。
+  边界语义与 OpenVDB"只更新 active 值"一致;
+- [x] 实现沿用 offset 的"密集 slab + 逐叶写回"范式:slab = 活动 bbox + 1 体素
+  halo,双缓冲 Jacobi,写回只覆盖活动 bbox(⚠️ 不调 `prune()`——stamp 产生的
+  带外值叶要保留,prune 会按"无 active 体素"丢弃它们,破坏链式等价性);
+- [x] 校验:isotropic voxel_size、轴对齐、标量网格;vec 网格 / 旋转网格 / alpha
+  越界显式报错;ShapeKernel 移植层的 `voxSmoothen` 由此从
+  `NotImplementedError` 桩变为完整功能(门面 `smoothen()` 优先委派本算子)。

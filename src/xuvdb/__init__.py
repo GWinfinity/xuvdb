@@ -41,26 +41,35 @@ Kernels run on any quadrants backend; call `init_runtime()` once before the firs
 
 from .gpu import GpuVolume, VolumeBatch
 from .io import load, save
+from .mesh_to_sdf import dilated_mesh_shell, mesh_to_level_set
+from .meshing import level_set_to_mesh
+from .offset import offset
 from .openvdb_bridge import from_openvdb, to_openvdb
 from .openvdb_file import read_vdb, write_vdb
 from .ray import ray_surface_hit
 from .runtime import init_runtime
+from .smooth import smooth
 from . import torch_bridge
 from .tree import Leaf, VdbGrid
 
-__version__ = "1.2.0"
+__version__ = "1.3.1"
 
 __all__ = [
     "GpuVolume",
     "Leaf",
     "VdbGrid",
     "VolumeBatch",
+    "dilated_mesh_shell",
     "from_openvdb",
     "init_runtime",
+    "level_set_to_mesh",
     "load",
+    "mesh_to_level_set",
+    "offset",
     "ray_surface_hit",
     "read_vdb",
     "save",
+    "smooth",
     "to_openvdb",
     "write_vdb",
 ]

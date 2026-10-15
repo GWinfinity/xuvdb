@@ -52,6 +52,12 @@ uv pip install -e ".[test]" # 开发模式 + pytest
 可选 extras：`[openvdb]`（pyopenvdb 内存级互转）、`[torch]`（torch 桥：张量往返 + 可微采样）、
 `[genesis]`（运行引擎侧示例需要 genesis-world）、`[test]`（pytest）。
 
+引擎侧完整示例：`examples/test_packages.py`（驱动一个 genesis-world 刚体仿真，验证安装）、
+`examples/genesis_dune_smoke_puddle.py`（端到端场景：xuvdb 建地面——户外看似平坦的微起伏、
+室内地板与门槛——和新月形沙丘 level set，射线查询布景 → genesis-world 里 MPM 沙 + PBD 水洼 +
+stable-fluids 烟雾同场景仿真 → 粒子/场回收为稀疏体素，落盘 `desert.xuvdb` 与逐场 `.vdb`，
+Houdini/Blender 可直接读）。
+
 ## 快速上手
 
 ```python
@@ -181,7 +187,16 @@ ScaleTranslateMap；任何 OpenVDB ≥ 9 可读。
   压缩）；out-of-core 以 `iter_leaves` / `iter_slabs` 流式原语提供（不是完整分页引擎）；
   窄带 SDF 重整（reinit）**未提供**——Sussman PDE 与 chamfer-Dijkstra 两种实验方案都在
   凹缝处过不了质量门槛（根因：界面亚体素信息在体素化时已丢失），需要图元感知的局部
-  精确重算，顺延至 2.0+（测量数据见 ROADMAP）。
+  精确重算，顺延至 2.0+（测量数据见 ROADMAP）。**没有 reinit 直接影响 1.3.0 新增的
+  `offset()`**：一阶 Godunov 推进在小步长（≤几体素）精度良好（实测 0.25 体素），
+  反复/大距离偏移会像 OpenVDB 的 `LevelSetFilter::offset` 一样偏离真距离场，文档化不隐藏。
+- **1.3.0 新增的表面算子**（为 PicoGK 迁移而做，通用可用）：`level_set_to_mesh`（marching
+  cubes，256 情形表，顶点焊接）、`mesh_to_level_set` / `dilated_mesh_shell`（点到三角形
+  精确距离 + +X 射线奇偶符号，千级三角形、十万级窄带体素数秒级）、`offset`（窄带 upwind
+  等距偏移）；1.3.1 新增 `smooth`（`LevelSetFilter::smooth` 等价：活动 bbox 内
+  Laplacian Jacobi 松弛，alpha∈(0,1] 凸组合无条件稳定；active 掩码不动、
+  链式调用与单次多迭代等价）。网格 metadata（string/bool/int/float/vec3）随 `.vdb`
+  读写往返（`grid.metadata` dict，保留键拒绝写入）。
 - `GpuVolume` 只支持 f32 标量网格（f16/f64/vec3 为宿主与格式层类型）；写入只改值不改拓扑、
   不动 active 掩码（掩码是宿主侧状态）。**掩码语义**：内核写进 inactive 体素的值能通过
   `sample*`、`.xuvdb` 存取、`to_dense`、射线看到（叶是稠密缓冲），但 **`write_vdb` 与
