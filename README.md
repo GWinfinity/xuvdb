@@ -195,7 +195,9 @@ ScaleTranslateMap；任何 OpenVDB ≥ 9 可读。
   精确距离 + +X 射线奇偶符号，千级三角形、十万级窄带体素数秒级）、`offset`（窄带 upwind
   等距偏移）；1.3.1 新增 `smooth`（`LevelSetFilter::smooth` 等价：活动 bbox 内
   Laplacian Jacobi 松弛，alpha∈(0,1] 凸组合无条件稳定；active 掩码不动、
-  链式调用与单次多迭代等价）。网格 metadata（string/bool/int/float/vec3）随 `.vdb`
+  链式调用与单次多迭代等价）；1.3.2 起 `offset`/`smooth` 的 dense slab 按
+  `max_slab_voxels` 分块（锁定步进 + halo，结果与整块一致），十亿级 active
+  的峰值内存封顶 ~2.5GB/块。网格 metadata（string/bool/int/float/vec3）随 `.vdb`
   读写往返（`grid.metadata` dict，保留键拒绝写入）。
 - `GpuVolume` 只支持 f32 标量网格（f16/f64/vec3 为宿主与格式层类型）；写入只改值不改拓扑、
   不动 active 掩码（掩码是宿主侧状态）。**掩码语义**：内核写进 inactive 体素的值能通过

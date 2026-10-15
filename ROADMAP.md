@@ -97,6 +97,18 @@ OpenVDB 流"。
   ≈ −0.04;根因:界面亚体素信息在体素化时已丢失,网格重整法的固有边界)。正确方案
   需要图元感知的局部精确重算,属 2.0+ 的设计变更。测量数据在 1.2.0 开发提交中。
 
+## v1.3.2 — slab 算子分块化（十亿级内存封顶）✅ 1.3.2
+
+- [x] `offset` / `smooth` 的 dense slab 按 `max_slab_voxels`(默认 64M,~2.5GB f64
+  临时区)沿最长轴分块:锁定步进(每块抽取上一步全局态 +1 体素 halo、只写回内部),
+  结果与整块一致(smooth 逐位相同,offset 在 ±0.1 世界单位内 atol 2e-3 实测);
+- [x] 共享工具 `slab.py`:`tile_ranges`(预算+最小内部宽度约束)与 `write_region`
+  (按叶写回内部、不动 halo);offset 块内宽 ≥ |distance|+band+3,保证外推数据自足;
+- [x] 实测:100M active(11.8 万叶)整块 offset 在本机 OOM(单数组 6.8GB),分块后
+  通过（200M active、23.7 万叶、本机 32GB 内存，offset +2 体素 3034s，active 200.6M→210.9M）——十亿级验证从"需 256-512GB"降到"64-128GB 工作站可跑全算子";
+- [x] 新测试 `test_slab_chunking.py`:tile 预算/最小宽度、smooth 逐位等价、
+  offset 膨胀/收缩等价、参数校验(6 项)。
+
 ## v1.3.1 — 平滑算子 smooth ✅ 1.3.1
 
 - [x] `smooth(grid, iterations, alpha)`:OpenVDB `LevelSetFilter::smooth` 的等价物——

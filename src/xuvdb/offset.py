@@ -16,7 +16,7 @@ the band never runs into stale far-field values. The slab is written back leaf b
 import numpy as np
 
 
-def offset(grid, distance, band=None, n_steps=None):
+def offset(grid, distance, band=None, n_steps=None, max_slab_voxels=None):
     """Offset a narrow-band level set by `distance` (world units), in place.
 
     Solves the eikonal PDE dphi/dt = sign(distance) * |grad phi| with upwind
@@ -44,6 +44,13 @@ def offset(grid, distance, band=None, n_steps=None):
         Number of CFL steps (defaults to ``ceil(|distance| / (0.9*min(voxel_size)))``,
         i.e. each step moves the surface by at most ~0.9 voxels; every step is
         sub-cycled twice internally, so the effective advance is ~0.45 voxels).
+    max_slab_voxels : int, optional
+        Memory ceiling for the dense working slab, in voxels (default 64M,
+        ~2.5GB of float64 temporaries). The padded active bounding box is
+        processed in lockstep chunks of at most this many voxels, so peak memory
+        stays bounded at billion-active scales; each chunk carries a 1-voxel
+        halo and interiors are kept >= ``|distance| + band + 3`` so results are
+        identical to the monolithic slab within the accuracy contract above.
     """
     if grid.is_vec:
         raise TypeError("offset is defined on scalar grids only")
@@ -73,6 +80,11 @@ def offset(grid, distance, band=None, n_steps=None):
     n_steps *= 2
     dt = abs(distance) / n_steps
     s = 1.0 if distance > 0.0 else -1.0  # dphi/dt = -s * |grad phi|: dilation shrinks phi
+    if max_slab_voxels is None:
+        max_slab_voxels = 64_000_000
+    max_slab_voxels = int(max_slab_voxels)
+    if max_slab_voxels < 1_000_000:
+        raise ValueError("max_slab_voxels must be >= 1,000,000")
 
     bbox = grid.bbox()
     if bbox is None:
@@ -80,36 +92,80 @@ def offset(grid, distance, band=None, n_steps=None):
     pad = int(np.ceil(abs(distance) / h_min)) + int(np.ceil(band_world / h_min)) + 3
     dlo = np.asarray(bbox[0], dtype=np.int64) - pad
     dhi = np.asarray(bbox[1], dtype=np.int64) + pad
+    # interiors must hold the full reach of extrapolated data (|distance| + band)
+    chunks = _tile_ranges(dlo, dhi, max_slab_voxels, min_width=pad)
+    from .slab import leaves_overlapping
+    chunk_leaves = [leaves_overlapping(grid, lo - 1, hi + 1) for lo, hi in chunks]
 
-    phi, active = _dense_view(grid, dlo, dhi)
-
-    # Fill the near far field: breadth-first extrapolation sweeps so the voxels the
-    # front can reach carry a meaningful signed distance. Unallocated / untouched
-    # voxels read the background, whose sign is blind (positive "far outside" even
-    # deep inside the surface) - without this the eroding front would sweep into
-    # wrong-sign values. The surface advances at most |distance| (+1 safety voxel),
-    # so that many layers of extrapolation suffice; beyond them the per-step band
-    # extension maintains one voxel of meaningful values ahead of the front.
     bg = float(grid.background)
-    known = active.copy()
     n_layers = int(np.ceil(abs(distance) / h_min)) + 2
-    for _ in range(n_layers):
-        if not _extend(phi, known, vs, bg).any():
-            break
-    active = np.abs(phi) < band_world
+    # leaves entirely outside the slab cannot hold band voxels of the offset
+    # surface; deactivate them up front (the band never leaves the slab)
+    dim = grid.leaf_dim
+    for leaf in list(grid._leaves.values()):
+        if np.any(leaf.origin + dim - 1 < dlo) or np.any(leaf.origin > dhi):
+            leaf.active[...] = False
+            leaf.values[...] = bg
+            leaf.invalidate()
 
+    # Fill the near far field: breadth-first extrapolation sweeps so the voxels
+    # the front can reach carry a meaningful signed distance. Each chunk runs the
+    # sweeps on its own slab (1-voxel halo); only the interior is written back,
+    # so halo approximations never reach the result.
+    for leaves, (lo, hi) in zip(chunk_leaves, chunks):
+        slo, shi = lo - 1, hi + 1
+        phi, known = _dense_view(grid, slo, shi, leaves)
+        known = known.copy()
+        for _ in range(n_layers):
+            if not _extend(phi, known, vs, bg).any():
+                break
+        active = np.abs(phi) < band_world
+        _write_region(grid, phi, active, lo, hi, slo, leaves)
+
+    # CFL steps, lockstep across chunks: every chunk extracts the previous
+    # iteration's state (halo included), advances one step, writes its interior
     for _ in range(n_steps):
-        active = _step(phi, active, vs, bg, band_world, abs(dt), s)
-    _write_back(grid, phi, active, dlo, dhi)
+        for leaves, (lo, hi) in zip(chunk_leaves, chunks):
+            slo, shi = lo - 1, hi + 1
+            phi, active = _dense_view(grid, slo, shi, leaves)
+            active = _step(phi, active, vs, bg, band_world, abs(dt), s)
+            _write_region(grid, phi, active, lo, hi, slo, leaves)
+    grid.prune()
     return grid
 
 
-def _dense_view(grid, dlo, dhi):
-    """`(phi, active)` dense float64 views of the slab [dlo, dhi]; background outside."""
+def _tile_ranges(lo, hi, max_voxels, min_width=1):
+    from .slab import tile_ranges
+    return tile_ranges(lo, hi, max_voxels, min_width)
+
+
+def _write_region(grid, phi, active, lo, hi, dlo, leaves=None):
+    from .slab import write_region
+    write_region(grid, phi, active, lo, hi, dlo, leaves)
+
+
+def _dense_view(grid, dlo, dhi, leaves=None):
+    """`(phi, active)` dense float64 views of the slab [dlo, dhi]; background outside.
+
+    ``leaves`` may be a precomputed overlap list (see slab.leaves_overlapping)."""
     shape = tuple(int(v) for v in (dhi - dlo + 1))
     vals = np.full(shape, float(grid.background), dtype=np.float64)
     act = np.zeros(shape, dtype=bool)
-    for leaf, sl in grid._for_each_leaf_slice(dlo, dhi, create=False):
+    if leaves is None:
+        it = ((leaf, sl) for leaf, sl in grid._for_each_leaf_slice(dlo, dhi, create=False))
+    else:
+        dim = grid.leaf_dim
+        def _slices():
+            for leaf in leaves:
+                llo = np.maximum(leaf.origin, dlo)
+                lhi = np.minimum(leaf.origin + dim - 1, dhi)
+                if np.any(lhi < llo):
+                    continue
+                sl = tuple(slice(int(llo[a] - leaf.origin[a]), int(lhi[a] - leaf.origin[a]) + 1)
+                           for a in range(3))
+                yield leaf, sl
+        it = _slices()
+    for leaf, sl in it:
         dst = tuple(slice(int(leaf.origin[a] + sl[a].start - dlo[a]),
                           int(leaf.origin[a] + sl[a].stop - dlo[a])) for a in range(3))
         vals[dst] = leaf.values[sl]
@@ -205,37 +261,3 @@ def _step(phi, active, vs, bg, band_world, dt, s):
     grad += phi
     np.copyto(phi, grad, where=update)
     return np.abs(phi) < band_world  # re-stamped band follows the new surface
-
-
-def _write_back(grid, phi, active, dlo, dhi):
-    """Write the slab back leaf by leaf; deactivate everything the offset left outside."""
-    dim = grid.leaf_dim
-    lg = grid.leaf_log2
-    bg = float(grid.background)
-
-    # Leaves entirely outside the slab cannot hold band voxels of the offset surface
-    # (the slab is padded by |distance| + band + 3), so their activity dies here.
-    for leaf in list(grid._leaves.values()):
-        if np.any(leaf.origin + dim - 1 < dlo) or np.any(leaf.origin > dhi):
-            leaf.active[...] = False
-            leaf.values[...] = bg
-            leaf.invalidate()
-
-    for kx in range(int(dlo[0]) >> lg, (int(dhi[0]) >> lg) + 1):
-        for ky in range(int(dlo[1]) >> lg, (int(dhi[1]) >> lg) + 1):
-            for kz in range(int(dlo[2]) >> lg, (int(dhi[2]) >> lg) + 1):
-                key = (kx, ky, kz)
-                lo_l = [int(max(dlo[a], (key[a] << lg)) - (key[a] << lg)) for a in range(3)]
-                hi_l = [int(min(dhi[a], (key[a] << lg) + dim - 1) - (key[a] << lg)) for a in range(3)]
-                src = tuple(slice(lo_l[a], hi_l[a] + 1) for a in range(3))
-                dst = tuple(slice(lo_l[a] + (key[a] << lg) - int(dlo[a]),
-                                  hi_l[a] + (key[a] << lg) - int(dlo[a]) + 1) for a in range(3))
-                if key not in grid._leaves and not active[dst].any():
-                    continue  # never materialize a fully-inactive leaf
-                leaf = grid._get_or_create_leaf(key)
-                leaf.values[...] = bg
-                leaf.active[...] = False
-                leaf.values[src] = phi[dst]
-                leaf.active[src] = active[dst]
-                leaf.invalidate()
-    grid.prune()

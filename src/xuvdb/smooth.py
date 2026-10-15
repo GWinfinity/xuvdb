@@ -23,7 +23,7 @@ are untouched and the original active mask is preserved.
 import numpy as np
 
 
-def smooth(grid, iterations=1, alpha=0.5):
+def smooth(grid, iterations=1, alpha=0.5, max_slab_voxels=None):
     """Smooth a narrow-band level set in place (OpenVDB ``LevelSetFilter::smooth``).
 
     Each iteration relaxes the stored value of every voxel inside the active
@@ -44,6 +44,13 @@ def smooth(grid, iterations=1, alpha=0.5):
         are a no-op.
     alpha : float
         Relaxation weight in (0, 1]; 1.0 applies the full Laplacian step.
+    max_slab_voxels : int, optional
+        Memory ceiling for the dense working slab, in voxels (default 64M,
+        ~1GB of float64 temporaries). The active bounding box is swept in
+        lockstep chunks of at most this many voxels (1-voxel halo), so peak
+        memory stays bounded at billion-active scales. Chunks are exact: every
+        voxel still reads previous-iteration neighbor values, so results are
+        identical to the monolithic slab.
 
     Returns
     -------
@@ -59,63 +66,61 @@ def smooth(grid, iterations=1, alpha=0.5):
         return grid
     if not (0.0 < float(alpha) <= 1.0):
         raise ValueError("alpha must be in (0, 1]")
+    if max_slab_voxels is None:
+        max_slab_voxels = 64_000_000
+    max_slab_voxels = int(max_slab_voxels)
+    if max_slab_voxels < 1_000_000:
+        raise ValueError("max_slab_voxels must be >= 1,000,000")
 
     bbox = grid.bbox()
     if bbox is None:
         return grid
-    dlo = np.asarray(bbox[0], dtype=np.int64) - 1
-    dhi = np.asarray(bbox[1], dtype=np.int64) + 1
+    dlo_full = np.asarray(bbox[0], dtype=np.int64)
+    dhi_full = np.asarray(bbox[1], dtype=np.int64)
 
-    phi = _dense_view(grid, dlo, dhi)
-    # target block = the active bounding box; everything else stays frozen
-    t0 = tuple(int(bbox[0][a] - dlo[a]) for a in range(3))
-    t1 = tuple(int(bbox[1][a] - dlo[a]) + 1 for a in range(3))
-    new = phi.copy()
+    from .slab import tile_ranges, write_region, leaves_overlapping
+    chunks = tile_ranges(dlo_full, dhi_full, max_slab_voxels, min_width=1)
+    chunk_leaves = [leaves_overlapping(grid, lo - 1, hi + 1) for lo, hi in chunks]
+
+    # Jacobi sweeps, lockstep across chunks: every chunk extracts the previous
+    # iteration's state with a 1-voxel halo, relaxes its interior, writes it
+    # back. Interior voxels always read previous-iteration neighbor values, so
+    # the chunked sweep is identical to the monolithic double-buffered sweep.
     for _ in range(iterations):
-        c = phi[t0[0]:t1[0], t0[1]:t1[1], t0[2]:t1[2]]
-        avg = (phi[t0[0] + 1:t1[0] + 1, t0[1]:t1[1], t0[2]:t1[2]]
-               + phi[t0[0] - 1:t1[0] - 1, t0[1]:t1[1], t0[2]:t1[2]]
-               + phi[t0[0]:t1[0], t0[1] + 1:t1[1] + 1, t0[2]:t1[2]]
-               + phi[t0[0]:t1[0], t0[1] - 1:t1[1] - 1, t0[2]:t1[2]]
-               + phi[t0[0]:t1[0], t0[1]:t1[1], t0[2] + 1:t1[2] + 1]
-               + phi[t0[0]:t1[0], t0[1]:t1[1], t0[2] - 1:t1[2] - 1]) / 6.0
-        new[t0[0]:t1[0], t0[1]:t1[1], t0[2]:t1[2]] = c + alpha * (avg - c)
-        phi, new = new, phi  # swap buffers; `phi` always holds the current field
-
-    _write_back(grid, phi, bbox, dlo)
+        for leaves, (lo, hi) in zip(chunk_leaves, chunks):
+            slo, shi = lo - 1, hi + 1
+            phi = _dense_view(grid, slo, shi, leaves)
+            c = phi[1:-1, 1:-1, 1:-1]
+            avg = (phi[2:, 1:-1, 1:-1] + phi[:-2, 1:-1, 1:-1]
+                   + phi[1:-1, 2:, 1:-1] + phi[1:-1, :-2, 1:-1]
+                   + phi[1:-1, 1:-1, 2:] + phi[1:-1, 1:-1, :-2]) / 6.0
+            phi[1:-1, 1:-1, 1:-1] = c + alpha * (avg - c)
+            write_region(grid, phi, None, lo, hi, slo, leaves)
     return grid
 
 
-def _dense_view(grid, dlo, dhi):
-    """Dense float64 slab [dlo, dhi] of the stored values; background outside."""
+def _dense_view(grid, dlo, dhi, leaves=None):
+    """Dense float64 slab [dlo, dhi] of the stored values; background outside.
+
+    ``leaves`` may be a precomputed overlap list (see slab.leaves_overlapping)."""
     shape = tuple(int(v) for v in (dhi - dlo + 1))
     vals = np.full(shape, float(grid.background), dtype=np.float64)
-    for leaf, sl in grid._for_each_leaf_slice(dlo, dhi, create=False):
+    if leaves is None:
+        leaf_slices = grid._for_each_leaf_slice(dlo, dhi, create=False)
+    else:
+        dim = grid.leaf_dim
+        def _gen():
+            for leaf in leaves:
+                llo = np.maximum(leaf.origin, dlo)
+                lhi = np.minimum(leaf.origin + dim - 1, dhi)
+                if np.any(lhi < llo):
+                    continue
+                sl = tuple(slice(int(llo[a] - leaf.origin[a]), int(lhi[a] - leaf.origin[a]) + 1)
+                           for a in range(3))
+                yield leaf, sl
+        leaf_slices = _gen()
+    for leaf, sl in leaf_slices:
         dst = tuple(slice(int(leaf.origin[a] + sl[a].start - dlo[a]),
                           int(leaf.origin[a] + sl[a].stop - dlo[a])) for a in range(3))
         vals[dst] = leaf.values[sl]
     return vals
-
-
-def _write_back(grid, phi, bbox, dlo):
-    """Write the smoothed slab back over the active bounding box, leaf by leaf.
-
-    Only the region the grid already covers ([bbox]) receives new values; the
-    halo and every leaf outside it keep their previous contents. The active
-    mask is not modified - smoothing moves the surface only second-order.
-    """
-    for leaf in list(grid._leaves.values()):
-        # overlap of this leaf with the active bounding box, in global coords
-        glo = np.maximum(leaf.origin, bbox[0])
-        ghi = np.minimum(leaf.origin + grid.leaf_dim - 1, bbox[1])
-        if np.any(ghi < glo):
-            continue
-        slab = tuple(slice(int(glo[a] - dlo[a]), int(ghi[a] - dlo[a]) + 1)
-                     for a in range(3))
-        loc = tuple(slice(int(glo[a] - leaf.origin[a]), int(ghi[a] - leaf.origin[a]) + 1)
-                    for a in range(3))
-        leaf.values[loc] = phi[slab]
-        leaf.invalidate()
-    # NOTE: no prune() here - the active mask is unchanged, and fringe leaves
-    # that hold meaningful beyond-band values (which prune would discard) must
-    # survive so repeated calls see the same far field.
