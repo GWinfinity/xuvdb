@@ -108,6 +108,27 @@ def offset(grid, distance, band=None, n_steps=None, max_slab_voxels=None):
             leaf.values[...] = bg
             leaf.invalidate()
 
+    if len(chunks) == 1:
+        # Fast path for the common small/medium grid: one chunk's slab stays in
+        # memory across the whole solve, skipping the per-step extract/write-back
+        # rounds below. Numerically identical to the chunked path: re-extraction
+        # would rebuild the interior from the latest leaf state (which is exactly
+        # the in-memory interior) and the halo from untouched leaf values (which
+        # is exactly what the in-memory halo still holds).
+        leaves = chunk_leaves[0]
+        lo, hi = chunks[0]
+        slo, shi = lo - 1, hi + 1
+        phi, known = _dense_view(grid, slo, shi, leaves)
+        for _ in range(n_layers):
+            if not _extend(phi, known, vs, bg).any():
+                break
+        active = np.abs(phi) < band_world
+        for _ in range(n_steps):
+            active = _step(phi, active, vs, bg, band_world, abs(dt), s)
+        _write_region(grid, phi, active, lo, hi, slo, leaves)
+        grid.prune()
+        return grid
+
     # Fill the near far field: breadth-first extrapolation sweeps so the voxels
     # the front can reach carry a meaningful signed distance. Each chunk runs the
     # sweeps on its own slab (1-voxel halo); only the interior is written back,
