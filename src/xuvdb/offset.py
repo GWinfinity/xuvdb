@@ -120,8 +120,10 @@ def offset(grid, distance, band=None, n_steps=None, max_slab_voxels=None):
         slo, shi = lo - 1, hi + 1
         phi, known = _dense_view(grid, slo, shi, leaves)
         for _ in range(n_layers):
-            if not _extend(phi, known, vs, bg).any():
+            ext = _extend(phi, known, vs, bg)
+            if not ext.any():
                 break
+            known |= ext
         active = np.abs(phi) < band_world
         for _ in range(n_steps):
             active = _step(phi, active, vs, bg, band_world, abs(dt), s)
@@ -138,8 +140,10 @@ def offset(grid, distance, band=None, n_steps=None, max_slab_voxels=None):
         phi, known = _dense_view(grid, slo, shi, leaves)
         known = known.copy()
         for _ in range(n_layers):
-            if not _extend(phi, known, vs, bg).any():
+            ext = _extend(phi, known, vs, bg)
+            if not ext.any():
                 break
+            known |= ext
         active = np.abs(phi) < band_world
         _write_region(grid, phi, active, lo, hi, slo, leaves)
 
@@ -205,6 +209,7 @@ def _extend(phi, known, vs, bg):
     P = np.pad(phi, 1, mode="constant", constant_values=bg)
     KP = np.pad(known, 1, mode="constant", constant_values=False)
     best = np.full(n, np.inf)  # value of the known neighbor closest to the surface
+    abs_best = np.full(n, np.inf)  # |best|, tracked in place to skip per-direction temporaries
     best_h = np.ones(n)
     found = np.zeros(n, dtype=bool)
     for a in range(3):
@@ -213,9 +218,11 @@ def _extend(phi, known, vs, bg):
             sl[a] = slice(1 + t, 1 + t + n[a])
             v = P[tuple(sl)]
             kv = KP[tuple(sl)]
-            take = kv & (np.abs(v) < np.abs(best))
-            best = np.where(take, v, best)
-            best_h = np.where(take, vs[a], best_h)
+            av = np.abs(v)
+            take = kv & (av < abs_best)
+            np.copyto(best, v, where=take)
+            np.copyto(abs_best, av, where=take)
+            np.copyto(best_h, vs[a], where=take)
             found |= kv
     ext = found & ~known
     phi[ext] = best[ext] + np.sign(best[ext]) * best_h[ext]
