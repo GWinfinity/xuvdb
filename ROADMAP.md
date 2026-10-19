@@ -70,6 +70,34 @@ OpenVDB 流"。
 
 依赖面变化从 v0.4 起须在 changelog 显式声明(blosc 依赖、torch extra)。
 
+## v1.3.4 — 解析器加固（安全审计 High/Medium 修复）✅ 1.3.4
+
+针对外部二进制审计（3 High / 3 Medium / 5 Low，全部经 PoC 实测）修复高/中危项，
+Low 项（L-1~L-5）与"建议级"改动维持原状。行为变化：**越界叶坐标的文件现在在解析
+阶段被拒绝**（此前载入成功但 GPU 采样静默撞键）；超大声明量的文件被拒绝或警告
+跳过。验收以审计复测判据为准（PoC 构造式回归，见 `tests/test_security.py`，17 项）：
+
+- [x] **H-1 物化放大**：`n_tiles`/`n_int5`/`n_leaves` 按"剩余字节数可装下的最小记录数"
+  校验（伪造即 ValueError）；`.vdb` tile 物化受 `max_tile_voxels` 与全局 2^24 体素预算
+  双重约束（耗尽警告并跳过，8.4 KB mask 文件不再能换 343 GB）；`.xuvdb` 单网格物化
+  超 2^24 体素拒绝并指向 `iter_leaves`/`iter_slabs`；
+- [x] **H-2 解压炸弹**：容器级 zlib 统一走 `decompressobj(max_length)` 有界解压
+  （小文件 ≥256 MiB 余量、≤64:1 压缩比、硬顶 4 GiB），CRC 移到解压后——CRC 防篡改
+  不防资源耗尽；`.vdb` ZIP 值块补齐解压后长度比对（对齐既有 blosc 分支）；
+- [x] **H-3 键空间溢出**：`xuvdb_pack_key` 内核侧越界返回 -1（查询回退背景，与宿主
+  一致；不再进位串轴撞键）；`gpu._pack_key` 越界显式 ValueError；`io.load` /
+  `iter_leaves` / `read_vdb` 解析期拒绝越界叶/文件；宿主树保持无界（约束只落在
+  打包与解析边界）；
+- [x] **M-1 非有限参数**：`voxel_size`/`origin_world`/`background`/`rotation` 构造期
+  `np.isfinite` 校验（NaN/Inf 此前绕过正数守卫，Inf 使 world_to_index 塌缩成常数）；
+- [x] **M-2 线格式枚举白名单**：未知 type/class 码一律 ValueError（此前 class 码越界
+  抛 IndexError、未知 type 码被静默解释成 float64）；`iter_leaves` 复用同一校验并补
+  `leaf_log2` 范围检查（顺带收窄 L-2 的双路径漂移）；
+- [x] **M-3 网格名混淆**：`.vdb` 描述符名与元数据名不一致即拒绝（"取 A 得 B"）；
+  `write_vdb` 拒绝名字含 U+001E（OpenVDB 重名分隔符，roundtrip 按名检索会 KeyError）；
+- [x] 回归：全套 106 项 + 新增安全测试 17 项全绿；quadrants 内核守卫经
+  CPU 后端编译验证（注意：qd.func 内不支持非 static 分支早退，守卫写成三元表达式）。
+
 ## v1.3 — 表面算子(marching cubes / offset / mesh→SDF / metadata) ✅ 1.3.0
 
 - [x] `level_set_to_mesh`:marching cubes(256 情形查找表,向量化逐叶推进,跨立方体棱边

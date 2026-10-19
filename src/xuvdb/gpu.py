@@ -16,6 +16,17 @@ _KEY_OFF = 1 << 19
 
 
 def _pack_key(kx, ky, kz):
+    """Pack a leaf coordinate into the sorted 60-bit table key.
+
+    Raises ValueError outside [-2^19, 2^19): a coordinate beyond the packed-key domain
+    would carry into the neighbour axis and alias an unrelated leaf (H-3) - loud refusal
+    here, and the kernel-side `xuvdb_pack_key` maps the same case to "no leaf"."""
+    for v in (int(kx), int(ky), int(kz)):
+        if not -_KEY_OFF <= v < _KEY_OFF:
+            raise ValueError(
+                f"leaf coordinate {v} outside the packed-key range "
+                f"[{-_KEY_OFF}, {_KEY_OFF}) per axis; split the grid or raise leaf_log2"
+            )
     return (int(kx) + _KEY_OFF) * (1 << 40) + (int(ky) + _KEY_OFF) * (1 << 20) + (int(kz) + _KEY_OFF)
 
 

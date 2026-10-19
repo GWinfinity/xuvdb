@@ -18,9 +18,18 @@ _KEY_OFF = 1 << 19  # per-axis leaf coordinate offset; supports +-524288 leaves 
 
 @qd.func
 def xuvdb_pack_key(kx: qd.i64, ky: qd.i64, kz: qd.i64) -> qd.i64:
-    return (kx + qd.i64(_KEY_OFF)) * qd.i64(1 << 40) + (ky + qd.i64(_KEY_OFF)) * qd.i64(1 << 20) + (
+    """Pack leaf coords into the sorted 60-bit table key.
+
+    Coordinates outside [-2^19, 2^19) would carry into the neighbour axis and alias a
+    real leaf (H-3), so out-of-range values return -1, which matches no packed key:
+    lookups then fall back to the background, consistent with the host tree."""
+    ok = (kx >= qd.i64(-_KEY_OFF)) and (kx < qd.i64(_KEY_OFF)) \
+        and (ky >= qd.i64(-_KEY_OFF)) and (ky < qd.i64(_KEY_OFF)) \
+        and (kz >= qd.i64(-_KEY_OFF)) and (kz < qd.i64(_KEY_OFF))
+    key = (kx + qd.i64(_KEY_OFF)) * qd.i64(1 << 40) + (ky + qd.i64(_KEY_OFF)) * qd.i64(1 << 20) + (
         kz + qd.i64(_KEY_OFF)
     )
+    return key if ok else qd.i64(-1)
 
 
 @qd.func
@@ -31,6 +40,8 @@ def xuvdb_find_leaf(
     ky: qd.i64,
     kz: qd.i64,
 ) -> int:
+    # key == -1 (out-of-range coordinate) can never match: the search collapses to lo=0
+    # and keys[0] >= 0 != -1, so no extra guard branch is needed here.
     key = xuvdb_pack_key(kx, ky, kz)
     lo = 0
     hi = n_leaves

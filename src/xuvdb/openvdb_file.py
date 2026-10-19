@@ -23,8 +23,9 @@ metadata-6 (full array) when a leaf carries irregular inactive values. Reading s
 COMPRESS_NONE, COMPRESS_ZIP (via the stdlib zlib), COMPRESS_ACTIVE_MASK and `_HalfFloat` grids;
 Blosc-compressed grids raise an informative error.
 
-Root-level tiles are materialized into dense leaves when reading (bounded by `max_tile_voxels`),
-and never emitted when writing.
+Root-level tiles are materialized into dense leaves when reading, bounded by the smaller
+of `max_tile_voxels` (per tile) and a global 2^24-voxel materialization budget (exhaustion
+warns and skips the remaining tiles), and never emitted when writing.
 """
 
 import struct
@@ -34,7 +35,8 @@ import zlib
 
 import numpy as np
 
-from .tree import GRID_CLASSES, VdbGrid
+from .io import _inflate_bounded
+from .tree import GRID_CLASSES, KERNEL_KEY_LIMIT, VdbGrid
 
 try:
     import blosc
@@ -166,6 +168,10 @@ class _ReadStream:
     def raw(self, n):
         return self._take(n)
 
+    def remaining(self):
+        """Bytes left - the physical upper bound every count field is checked against."""
+        return len(self.data) - self.pos
+
     def vec3d(self):
         return np.array(struct.unpack("<3d", self._take(24)))
 
@@ -216,6 +222,11 @@ def write_vdb(path, grids, blosc=False):
     s.u32(0)  # empty file-level metadata map
     s.i32(len(grids))
     for grid in grids:
+        if "\x1e" in grid.name:
+            raise ValueError(
+                f"grid name {grid.name!r} contains U+001E, the OpenVDB duplicate-name separator; "
+                "read_vdb would not be able to address this grid by name"
+            )
         if grid.type_code == 2:
             grid_type = "Tree_vec3s_5_4_3"
         else:
@@ -460,8 +471,11 @@ def read_vdb(path, grid_name=None, leaf_log2=3, max_tile_voxels=1 << 24):
     """Read grids from a `.vdb` file into `VdbGrid`s.
 
     `grid_name` selects a single grid by name; `leaf_log2` re-blocks the incoming 8^3 OpenVDB leaves
-    (pass 3 for a 1:1 mapping). Root/interior active tiles are materialized into dense leaves unless
-    a single tile exceeds `max_tile_voxels` voxels, in which case it is skipped with a warning.
+    (pass 3 for a 1:1 mapping). Root/interior active tiles are materialized into dense leaves until
+    the smaller of `max_tile_voxels` (per tile) and the global 2^24-voxel materialization budget is
+    exhausted, then skipped with a warning. Declared counts (n_tiles / n_int5 / n_leaves) are
+    validated against the remaining stream bytes, and leaf origins must fit the packed kernel-key
+    domain (+-2^19 leaves per axis) - violations raise ValueError at parse time.
     """
     with open(path, "rb") as f:
         data = f.read()
@@ -545,6 +559,11 @@ def _read_grid_stream(s, name, grid_type, from_half, leaf_log2, max_tile_voxels)
             "(pip install blosc) to read it"
         )
     meta = _read_meta_map(s)
+    # the descriptor name and the grid's own name metadata must agree - a forged file
+    # could otherwise make "read grid A" return a grid that claims to be B (M-3)
+    meta_name = meta.get("name")
+    if meta_name is not None and meta_name != name:
+        raise ValueError(f"grid name mismatch: descriptor {name!r} vs metadata {meta_name!r}")
 
     map_type = s.string()
     voxel_size, origin_world, rotation = _read_transform(s, map_type)
@@ -569,6 +588,12 @@ def _read_grid_stream(s, name, grid_type, from_half, leaf_log2, max_tile_voxels)
 
     n_tiles = s.u32()
     n_int5 = s.u32()
+    # count fields are bound by what the remaining stream can physically hold (H-1)
+    if n_tiles * 13 > s.remaining():  # i32[3] origin + >= 1 active byte + value
+        raise ValueError(f"n_tiles={n_tiles} exceeds what the remaining {s.remaining()} B can hold")
+    int5_min_record = 12 + 2 * _mask_words_for(_INT5_TABLE) * 8 + 1  # origin + 2 masks + metadata byte
+    if n_int5 * int5_min_record > s.remaining():
+        raise ValueError(f"n_int5={n_int5} exceeds what the remaining {s.remaining()} B can hold")
     tile_regions = []
     for _ in range(n_tiles):
         origin = np.frombuffer(s.raw(12), dtype="<i4").astype(np.int64)
@@ -603,10 +628,13 @@ def _read_grid_stream(s, name, grid_type, from_half, leaf_log2, max_tile_voxels)
                                                  compression, from_half)
                 _store_leaf(grid, leaf["origin"], active, values, components)
 
+    budget = min(int(max_tile_voxels), _ROOT_TILE_VOXELS)
     for origin, value in tile_regions:
-        if _INT4_DIM**3 > max_tile_voxels:
-            warnings.warn(f"skipping an active tile at {tuple(origin)} larger than max_tile_voxels")
-            continue
+        if _INT4_DIM**3 > budget:
+            warnings.warn("active-tile materialization voxel budget exhausted; "
+                          "skipping the remaining root tiles (raise max_tile_voxels to allow more)")
+            break
+        budget -= _INT4_DIM**3
         _fill_tile(grid, origin, _INT4_DIM, value, components)
     return grid
 
@@ -752,13 +780,30 @@ def _read_data_blob(s, num_bytes, compression):
         (zsize,) = struct.unpack("<q", s.raw(8))
         if zsize <= 0:
             return s.raw(-zsize)
-        blob = s.raw(zsize)
-        return zlib.decompress(blob)
+        raw = _inflate_bounded(s.raw(zsize), num_bytes)
+        if len(raw) != num_bytes:
+            raise ValueError(f"zip block inflated to {len(raw)} bytes, expected {num_bytes}")
+        return raw
     return s.raw(num_bytes)
+
+
+_ROOT_TILE_VOXELS = 1 << 24  # global materialization budget alongside max_tile_voxels
+
+
+def _check_leaf_origin(grid, origin):
+    """Leaf/tile origins must fit the packed kernel-key domain (H-3)."""
+    lg = grid.leaf_log2
+    kx, ky, kz = (int(origin[0]) >> lg, int(origin[1]) >> lg, int(origin[2]) >> lg)
+    if max(abs(kx), abs(ky), abs(kz)) >= KERNEL_KEY_LIMIT:
+        raise ValueError(
+            f"leaf/tile origin {tuple(int(v) for v in origin)} leaves the packed kernel-key "
+            f"domain +-{KERNEL_KEY_LIMIT} leaves per axis; split the grid or pass a larger leaf_log2"
+        )
 
 
 def _store_leaf(grid, origin, active_flat, values, components):
     dim = _LEAF_DIM
+    _check_leaf_origin(grid, origin)
     leaf = grid._get_or_create_leaf((int(origin[0]) >> grid.leaf_log2, int(origin[1]) >> grid.leaf_log2,
                                      int(origin[2]) >> grid.leaf_log2))
     local = np.asarray(origin) - leaf.origin
@@ -772,6 +817,7 @@ def _store_leaf(grid, origin, active_flat, values, components):
 
 def _fill_tile(grid, origin, dim, value, components):
     half = grid.leaf_dim
+    _check_leaf_origin(grid, origin)
     base = np.asarray(origin, dtype=np.int64)
     for kx in range(int(base[0]) >> grid.leaf_log2, (int(base[0]) + dim - 1 >> grid.leaf_log2) + 1):
         for ky in range(int(base[1]) >> grid.leaf_log2, (int(base[1]) + dim - 1 >> grid.leaf_log2) + 1):

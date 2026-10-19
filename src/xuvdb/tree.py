@@ -21,6 +21,13 @@ DEFAULT_LEAF_LOG2 = 4
 
 GRID_CLASSES = ("unknown", "level set", "fog volume", "staggered")
 
+#: Half-extent of the 60-bit packed kernel key space, in LEAF units: the quadrants
+#: kernels address leaves with `(kx + 2^19) << 40 | ...`, so every axis supports
+#: [-2^19, 2^19) leaves (+-8.4M voxels at leaf_log2=4). Host trees stay unbounded;
+#: every boundary that crosses into the packed-key domain (GpuVolume packing, file
+#: parsers) validates against this limit and fails loudly instead of aliasing keys.
+KERNEL_KEY_LIMIT = 1 << 19
+
 
 class Leaf:
     """One dense `dim^3` block of voxels with a per-voxel active mask.
@@ -113,6 +120,8 @@ class VdbGrid:
         self.dtype = dtype
 
         background = np.asarray(background, dtype=np.float64).reshape(-1)
+        if not np.all(np.isfinite(background)):
+            raise ValueError("background must be finite")
         if self.is_vec_shape(self.value_shape):
             self.background = np.broadcast_to(background, (3,)).astype(np.float32).copy()
         else:
@@ -124,16 +133,19 @@ class VdbGrid:
         self.leaf_dim = 1 << self.leaf_log2
 
         self.voxel_size = np.broadcast_to(np.asarray(voxel_size, dtype=np.float64).reshape(-1), (3,)).copy()
-        if np.any(self.voxel_size <= 0):
-            raise ValueError("voxel_size components must be positive")
+        if not np.all(np.isfinite(self.voxel_size)) or np.any(self.voxel_size <= 0):
+            raise ValueError("voxel_size components must be finite and positive")
         self.origin_world = np.broadcast_to(np.asarray(origin_world, dtype=np.float64).reshape(-1), (3,)).copy()
+        if not np.all(np.isfinite(self.origin_world)):
+            raise ValueError("origin_world components must be finite")
 
         if rotation is None:
             self.rotation = np.eye(3)
         else:
             self.rotation = np.asarray(rotation, dtype=np.float64).reshape(3, 3).copy()
-            if not np.allclose(self.rotation @ self.rotation.T, np.eye(3), atol=1e-8):
-                raise ValueError("rotation must be an orthonormal 3x3 matrix")
+            if not np.all(np.isfinite(self.rotation)) or \
+                    not np.allclose(self.rotation @ self.rotation.T, np.eye(3), atol=1e-8):
+                raise ValueError("rotation must be a finite orthonormal 3x3 matrix")
         self.is_axis_aligned = bool(np.allclose(self.rotation, np.eye(3)))
 
         self.name = str(name)

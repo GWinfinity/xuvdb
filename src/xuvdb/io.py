@@ -49,7 +49,7 @@ import zlib
 
 import numpy as np
 
-from .tree import GRID_CLASSES, VdbGrid
+from .tree import GRID_CLASSES, KERNEL_KEY_LIMIT, VdbGrid
 
 MAGIC = b"XUVDB"
 VERSION = 3
@@ -60,6 +60,55 @@ _GRID_FLAG_ROTATION = 0x01
 
 _TYPE_BY_CODE = {0: np.float32, 1: np.float64, 3: np.float16}
 _CODE_BY_TYPE = {np.dtype(np.float32): 0, np.dtype(np.float64): 1, np.dtype(np.float16): 3}
+
+# Parse-time resource budgets (see the security-audit hardening notes in README):
+# a grid whose declared leaves would materialize more voxels than this is rejected
+# with a pointer to the out-of-core streaming readers. Voxel data is dense f32-ish,
+# so 2^24 voxels ~= 100 MB of leaf buffers - far above typical single-grid use.
+_MAX_MATERIALIZED_VOXELS = 1 << 24
+
+# Decompression budget for the container-level zlib payload. Dense voxel payloads
+# compress at ~1-4:1, and legitimately zeros-like grids are already tiny on disk
+# (v3 constant-leaf encoding), so a 64:1 ratio with a 256 MiB floor is generous;
+# the 4 GiB hard cap bounds the worst case. A valid CRC does NOT lift this budget -
+# CRC protects integrity, not resource exhaustion.
+_INFLATE_FLOOR = 256 << 20
+_INFLATE_RATIO_CAP = 64
+_INFLATE_HARD_CAP = 4 << 30
+
+
+def _inflate_limit(compressed_len):
+    return min(_INFLATE_HARD_CAP, max(_INFLATE_FLOOR, _INFLATE_RATIO_CAP * compressed_len))
+
+
+def _inflate_bounded(payload, limit):
+    """zlib-decompress at most `limit` bytes of output; raise ValueError beyond.
+
+    `decompressobj.decompress(data, max_length)` caps the produced bytes, so a
+    crafted "bomb" is rejected before the full expansion is ever allocated.
+    """
+    d = zlib.decompressobj()
+    out = d.decompress(payload, limit + 1)
+    if len(out) > limit:
+        raise ValueError(f"decompressed payload exceeds the {limit} B budget (zlib bomb?)")
+    return out
+
+
+def _validate_grid_codes(type_code, class_code):
+    """Whitelist the wire enums; anything else is a forged/corrupt header (M-2)."""
+    if type_code not in _TYPE_BY_CODE and type_code != 2:
+        raise ValueError(f"unknown value type code {type_code}")
+    if class_code >= len(GRID_CLASSES):
+        raise ValueError(f"unknown grid class code {class_code} (max {len(GRID_CLASSES) - 1})")
+
+
+def _check_leaf_key_range(key, origin):
+    """Leaf keys must fit the 60-bit packed kernel key space (H-3)."""
+    if max(abs(int(k)) for k in key) >= KERNEL_KEY_LIMIT:
+        raise ValueError(
+            f"leaf origin {tuple(int(v) for v in origin)} leaves the packed kernel-key domain "
+            f"+-{KERNEL_KEY_LIMIT} leaves per axis; split the grid or use a larger leaf_log2"
+        )
 
 
 def _pack_str(s):
@@ -153,6 +202,10 @@ class _Reader:
         self.pos += n
         return out
 
+    def remaining(self):
+        """Bytes left - the physical upper bound every count field is checked against."""
+        return len(self.data) - self.pos
+
 
 def load(path):
     """Read all grids from a `.xuvdb` file (formats v1 and v2)."""
@@ -171,7 +224,7 @@ def load(path):
         crc = struct.unpack("<I", data[-4:])[0]
         payload = data[11:-4]
         if flags & _FLAG_COMPRESSED:
-            payload = zlib.decompress(payload)
+            payload = _inflate_bounded(payload, _inflate_limit(len(payload)))
         if flags & _FLAG_CRC and zlib.crc32(payload) & 0xFFFFFFFF != crc:
             raise ValueError(f"{path}: XUVDB payload checksum mismatch (file corrupted)")
         r = _Reader(payload)
@@ -180,6 +233,7 @@ def load(path):
         (name_len,) = struct.unpack("<I", r.read(4))
         name = r.read(name_len).decode("utf-8")
         type_code, leaf_log2, class_code, grid_flags = struct.unpack("<BBBB", r.read(4))
+        _validate_grid_codes(type_code, class_code)
         voxel_size = np.frombuffer(r.read(24), dtype="<f8")
         origin_world = np.frombuffer(r.read(24), dtype="<f8")
         rotation = None
@@ -192,7 +246,7 @@ def load(path):
         else:
             background = np.frombuffer(r.read(12 if type_code == 2 else 4), dtype="<f4").copy()
         grid = VdbGrid(
-            dtype=_TYPE_BY_CODE.get(type_code, None) if type_code != 2
+            dtype=_TYPE_BY_CODE[type_code] if type_code != 2
             else np.dtype([("x", np.float32), ("y", np.float32), ("z", np.float32)]),
             background=background,
             voxel_size=voxel_size,
@@ -204,9 +258,20 @@ def load(path):
         )
         (n_leaves,) = struct.unpack("<I", r.read(4))
         dim = 1 << leaf_log2
+        # the declared count must be physically possible from the remaining bytes (H-1)
+        min_record = 13 if version >= 3 else 12  # origin i32[3] + kind byte + >= 1 payload byte
+        if n_leaves * min_record > r.remaining():
+            raise ValueError(
+                f"n_leaves={n_leaves} exceeds what the remaining {r.remaining()} B can hold"
+            )
+        if n_leaves * dim**3 > _MAX_MATERIALIZED_VOXELS:
+            raise ValueError(
+                f"n_leaves={n_leaves} would materialize {n_leaves * dim**3} voxels, beyond the "
+                f"{_MAX_MATERIALIZED_VOXELS}-voxel budget; use iter_leaves/iter_slabs (out-of-core)"
+            )
         words = dim**3 // 64
         per_voxel = 3 if type_code == 2 else 1
-        item = _TYPE_BY_CODE.get(type_code, np.float32) if type_code != 2 else np.float32
+        item = _TYPE_BY_CODE[type_code] if type_code != 2 else np.float32
         wire_item = np.dtype("<f8") if type_code == 1 else np.dtype("<f2") if type_code == 3 else np.dtype("<f4")
         for _leaf in range(n_leaves):
             origin = np.frombuffer(r.read(12), dtype="<i4").astype(np.int64)
@@ -214,7 +279,9 @@ def load(path):
                 kind = r.read(1)[0]
             else:
                 kind = 0
-            leaf = grid._get_or_create_leaf((origin[0] >> leaf_log2, origin[1] >> leaf_log2, origin[2] >> leaf_log2))
+            key = (origin[0] >> leaf_log2, origin[1] >> leaf_log2, origin[2] >> leaf_log2)
+            _check_leaf_key_range(key, origin)
+            leaf = grid._get_or_create_leaf(key)
             if kind == 1:  # v3 constant leaf: whole block one value, uniformly active
                 value = np.frombuffer(r.read(wire_item.itemsize), dtype=wire_item).astype(item)
                 if per_voxel == 3:
@@ -252,7 +319,7 @@ def _parse_header(data, path):
         crc = struct.unpack("<I", data[-4:])[0]
         payload = data[11:-4]
         if flags & _FLAG_COMPRESSED:
-            payload = zlib.decompress(payload)
+            payload = _inflate_bounded(payload, _inflate_limit(len(payload)))
         if flags & _FLAG_CRC and zlib.crc32(payload) & 0xFFFFFFFF != crc:
             raise ValueError(f"{path}: XUVDB payload checksum mismatch (file corrupted)")
         r = _Reader(payload)
@@ -279,6 +346,30 @@ def _skip_grid_records(r, version, leaf_log2, type_code, n_leaves):
         r.read(dim**3 * per_voxel * wire_item.itemsize)
 
 
+def _read_preamble(r, version):
+    """Read one grid's fixed header; validates the wire enums and leaf_log2 range so the
+    streaming path (iter_leaves) and load() reject forged headers identically."""
+    (name_len,) = struct.unpack("<I", r.read(4))
+    name = r.read(name_len).decode("utf-8")
+    type_code, leaf_log2, class_code, grid_flags = struct.unpack("<BBBB", r.read(4))
+    _validate_grid_codes(type_code, class_code)
+    if not 2 <= leaf_log2 <= 6:
+        raise ValueError(f"leaf_log2 {leaf_log2} out of range [2, 6]")
+    r.read(24 + 24)
+    if version >= 2 and grid_flags & _GRID_FLAG_ROTATION:
+        r.read(72)
+    bg_bytes = 24 if type_code == 2 else (8 if type_code == 1 else 4)
+    r.read(bg_bytes)
+    (n_leaves,) = struct.unpack("<I", r.read(4))
+    return name, type_code, leaf_log2, n_leaves
+
+
+def _check_stream_counts(r, n_leaves, leaf_log2, version):
+    min_record = 13 if version >= 3 else 12
+    if n_leaves * min_record > r.remaining():
+        raise ValueError(f"n_leaves={n_leaves} exceeds what the remaining {r.remaining()} B can hold")
+
+
 def iter_leaves(path, grid_index=0):
     """Lazily yield `(origin i64[3], values ndarray, active ndarray)` per leaf of a stored grid -
     the out-of-core primitive: leaves arrive in origin order without building the whole tree.
@@ -293,32 +384,18 @@ def iter_leaves(path, grid_index=0):
     if not 0 <= grid_index < n_grids:
         raise IndexError(f"grid_index {grid_index} out of range ({n_grids} grids)")
     for gi in range(grid_index):
-        (name_len,) = struct.unpack("<I", r.read(4))
-        r.read(name_len)
-        type_code, leaf_log2, class_code, grid_flags = struct.unpack("<BBBB", r.read(4))
-        r.read(24 + 24)
-        if version >= 2 and grid_flags & _GRID_FLAG_ROTATION:
-            r.read(72)
-        bg_bytes = 24 if type_code == 2 else (8 if type_code == 1 else 4)
-        r.read(bg_bytes)
-        (n_leaves,) = struct.unpack("<I", r.read(4))
+        _, type_code, leaf_log2, n_leaves = _read_preamble(r, version)
+        _check_stream_counts(r, n_leaves, leaf_log2, version)
         _skip_grid_records(r, version, leaf_log2, type_code, n_leaves)
-    (name_len,) = struct.unpack("<I", r.read(4))
-    name = r.read(name_len).decode("utf-8")
-    type_code, leaf_log2, class_code, grid_flags = struct.unpack("<BBBB", r.read(4))
-    r.read(24 + 24)
-    if version >= 2 and grid_flags & _GRID_FLAG_ROTATION:
-        r.read(72)
-    bg_bytes = 24 if type_code == 2 else (8 if type_code == 1 else 4)
-    r.read(bg_bytes)
-    (n_leaves,) = struct.unpack("<I", r.read(4))
-    del name
+    _, type_code, leaf_log2, n_leaves = _read_preamble(r, version)
+    _check_stream_counts(r, n_leaves, leaf_log2, version)
     dim = 1 << leaf_log2
     per_voxel = 3 if type_code == 2 else 1
     wire_item = np.dtype("<f8") if type_code == 1 else np.dtype("<f2") if type_code == 3 else np.dtype("<f4")
-    item = _TYPE_BY_CODE.get(type_code, np.float32) if type_code != 2 else np.float32
+    item = _TYPE_BY_CODE[type_code] if type_code != 2 else np.float32
     for _leaf in range(n_leaves):
         origin = np.frombuffer(r.read(12), dtype="<i4").astype(np.int64)
+        _check_leaf_key_range(origin >> leaf_log2, origin)
         if version >= 3:
             kind = r.read(1)[0]
         else:
