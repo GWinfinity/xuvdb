@@ -38,6 +38,28 @@
 （活动占比远低于 1/叶体素数 ≈ 0.4%）或域远大于包围盒时成立；落盘后经 active-mask + Blosc
 压缩可回到 ~120KB 量级。完整表、复现脚本与规模声明见 BENCHMARKS.md 与「版本与稳定性」一节。
 
+**大规模基准（1.3.3，双 GPU 平台）**：球体 level set（dx=1/128，2,962 个 16³ 叶、
+123.5 万活跃体素、4.9 MB 活跃数据），`pip install xuvdb` 后开箱即用——AMD MI300X 自动
+走 `arch=amdgpu`、NVIDIA A10 自动走 `arch=cuda`，内核结果跨后端、跨机器逐位级一致
+（采样 checksum 两机逐位相同，法线余弦相似度 ≥0.99999988，DDA 命中集合完全一致，
+reduce 完全相同）。800 万点内核吞吐：
+
+| 算子 | MI300X (amdgpu) | A10 (CUDA) | GPU/CPU 加速比¹ |
+|---|---|---|---|
+| 采样·最近邻 | 719.0 Mpts/s | 282.8 Mpts/s | 2.9x / 3.6x |
+| 采样·三线性 | 529.5 Mpts/s | 271.5 Mpts/s | 11.7x / 20.6x |
+| 采样·三二次 B 样条 | 309.0 Mpts/s | 229.4 Mpts/s | 21.6x / 55.2x |
+| SDF 法线 | 151.4 Mpts/s | 75.9 Mpts/s | 19.0x / 35.7x |
+| VolumeBatch 跨 8 体积 | 399.5 Mpts/s | 152.3 Mpts/s | 6.2x / 8.4x |
+| 光线求交（262k 条 DDA） | 3.37 Mrays/s | 2.80 Mrays/s | 2.0x / 4.0x |
+
+¹ 加速比为同机 CPU 对照（MI300X 实例 23 vCPU / A10 实例 8 vCPU）。GPU 收益与算子算术
+强度正相关（插值越重收益越大）；A10 绝对吞吐为 MI300X 的 38–83%，差距主要由显存带宽
+决定（600 GB/s vs ~5.3 TB/s）。烘焙 / offset / 平滑 / 网格化 / I/O 是纯 NumPy 主机管线，
+GPU 不加速（25.6 万三角形烘焙 ~244–280 s、offset ~97–145 s，为大规模场景主要瓶颈）；
+原生 `.xuvdb` 比 `.vdb` 写快 ~10x、读快 ~7x，zip 压缩为 1/3 体积但写慢 ~27x。正确性对照、
+I/O 表与完整结论见 BENCHMARKS.md。
+
 定位不是替换任何求解器，而是补一个**可编辑的稀疏空间表示层**。
 
 ## 安装
@@ -88,7 +110,8 @@ d = vol.sample(pts, linear=True)          # SDF 距离（order=0/1/2 也提供�
 q = vol.sample(pts, order=2)              # 三次采样：C1 平滑（宿主侧 grid.sample_quadratic 同款）
 g = grid.sample_gradient(pts)             # 中心差分梯度（宿主）；stencil7/19_batch 供模板算子
 stats = vol.reduce()                      # active 求和/极值/计数（一次 kernel launch）
-n = vol.sdf_normal(pts)                   # 有限差分表面法向
+n = vol.sdf_normal(pts)                   # 有限差分表面法向（带边界自动单侧差分；带外零向量，
+                                          # extend=k 就近延拓法线场，return_valid=True 取有效掩码）
 vol.write_voxels(pts, np.array([-0.01], np.float32))
 vol.sync_to_host(refresh_mask=True)   # 内核写进 inactive 体素的值默认不进 write_vdb/active_*；
                                       # refresh_mask 重算掩码使其可见（sample/.xuvdb/to_dense 不受影响）
@@ -206,6 +229,12 @@ ScaleTranslateMap；任何 OpenVDB ≥ 9 可读。
   active；结构性编辑后仍需重新打包。
 - 内核仅支持轴对齐网格；带 `rotation` 的网格在宿主侧全功能（采样/射线/stamp/两种格式），
   交给 `GpuVolume` 会显式报错。
+- `VdbGrid.active_voxel_count` / `n_leaves` / `leaf_dim` 是 **property** 不是方法。
+  `sdf_normal` 的窄带限制已修复为良定义契约（1.3.3 大规模基准暴露的 0/0 方向翻转问题）：
+  带内中心差分不变；带边界 tap 出界时自动转单侧差分（一阶精度、跨后端确定）；带外返回
+  **精确零向量**（`return_valid=True` 取逐点有效掩码）；`extend=k` 让带外点采用切比雪夫
+  距离 ≤ k 内 stencil 最完好的活跃体素法线，支撑着色/碰撞外壳层。宿主 `sample_gradient`
+  镜像同一套单侧差分规则（不含 extend）。
 - `scatter_particles`／`union_spheres` 是 Python 循环 + 叶切片向量化：千级粒子适用，
   大规模生产需按叶批处理（未做）——这个量级下 `np.add.at` 的稠密散射也可能更快，本路径的
   价值在于结果直接在 GPU 上、免回传。`union_spheres` 的 min-of-spheres 距离在重叠粒子间

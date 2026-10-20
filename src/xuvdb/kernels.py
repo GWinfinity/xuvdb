@@ -81,6 +81,54 @@ def xuvdb_voxel_value(
 
 
 @qd.func
+def xuvdb_active_at(
+    keys: qd.types.ndarray(ndim=1),
+    mask: qd.types.ndarray(ndim=2),  # (n_leaves, dim^3/32) u32 active bits, bit n = voxel n (z-fastest)
+    n_leaves: int,
+    leaf_log2: int,
+    xi: qd.i64,
+    yi: qd.i64,
+    zi: qd.i64,
+) -> int:
+    """1 when the voxel at integer index (xi, yi, zi) is active, else 0 (unallocated = 0)."""
+    dim = 1 << leaf_log2
+    leaf_idx = xuvdb_find_leaf(keys, n_leaves, xi >> leaf_log2, yi >> leaf_log2, zi >> leaf_log2)
+    active = 0
+    if leaf_idx >= 0:
+        lx = xi & qd.i64(dim - 1)
+        ly = yi & qd.i64(dim - 1)
+        lz = zi & qd.i64(dim - 1)
+        n = lx * qd.i64(dim * dim) + ly * qd.i64(dim) + lz
+        word = qd.i64(mask[leaf_idx, n >> 5])
+        active = qd.i32((word >> (n & 31)) & 1)
+    return active
+
+
+@qd.func
+def xuvdb_axis_grad(fp: float, fm: float, f0: float, ap: int, am: int) -> float:
+    """One axis of a boundary-aware finite-difference derivative.
+
+    `fp`/`fm` are the field sampled one voxel along the +/- axis, `ap`/`am` their active flags,
+    `f0` the value at the query point itself. Both taps in-band keeps the classic central
+    difference `fp - fm`; a tap outside the narrow band falls back to a one-sided difference
+    against `f0`, x2-scaled so every branch approximates the true `|grad|` under a uniform
+    `1/(2h)` (host `sample_gradient` and the normalizing kernel stay direction-identical);
+    both taps out yields `0` - so deep-background points sum to the zero vector instead of
+    0/0 noise whose sign is float-rounding luck.
+    """
+    d = f0 - f0
+    if ap == 1:
+        if am == 1:
+            d = fp - fm
+        else:
+            d = 2.0 * (fp - f0)
+    else:
+        if am == 1:
+            d = 2.0 * (f0 - fm)
+    return d
+
+
+@qd.func
 def xuvdb_sample_nearest(
     keys: qd.types.ndarray(ndim=1),
     values: qd.types.ndarray(ndim=1),
@@ -194,6 +242,7 @@ def kernel_sample_linear(
 @qd.kernel
 def kernel_sdf_normal(
     keys: qd.types.ndarray(ndim=1),
+    mask: qd.types.ndarray(ndim=2),  # (n_leaves, dim^3/32) u32 active bits, bit n = voxel n (z-fastest)
     values: qd.types.ndarray(ndim=1),
     n_leaves: int,
     leaf_log2: int,
@@ -206,33 +255,143 @@ def kernel_sdf_normal(
     s_z: float,
     points: qd.types.ndarray(ndim=2),
     out: qd.types.ndarray(ndim=2),
+    valid: qd.types.ndarray(ndim=1),  # (n,) i32: 1 = normal is defined (in-band or extended)
+    extend: int,
 ):
-    """Central-difference surface normal of the SDF field at each point (world-space, normalized)."""
+    """Boundary-aware surface normal of the SDF field at each point (world-space, normalized).
+
+    Stencil taps outside the narrow band fall back to one-sided differences, so band-edge points
+    stay first-order accurate instead of degenerating into 0/0 noise. Points outside the band
+    get the zero vector (valid=0); with `extend` > 0 they instead adopt the normal of the nearest
+    active voxel within Chebyshev distance `extend` (normal-field dilation for shading/collision
+    shells) and are marked valid=1. For fully in-band points the arithmetic is identical to the
+    classic all-central-difference kernel.
+    """
     for i in range(points.shape[0]):
         x = points[i, 0]
         y = points[i, 1]
         z = points[i, 2]
-        nx = xuvdb_sample_linear(keys, values, n_leaves, leaf_log2, background, o_x, o_y, o_z, s_x, s_y, s_z,
-                                x + s_x, y, z) - xuvdb_sample_linear(keys, values, n_leaves, leaf_log2,
-                                                                    background, o_x, o_y, o_z, s_x, s_y, s_z,
-                                                                    x - s_x, y, z)
-        ny = xuvdb_sample_linear(keys, values, n_leaves, leaf_log2, background, o_x, o_y, o_z, s_x, s_y, s_z,
-                                x, y + s_y, z) - xuvdb_sample_linear(keys, values, n_leaves, leaf_log2,
-                                                                    background, o_x, o_y, o_z, s_x, s_y, s_z,
-                                                                    x, y - s_y, z)
-        nz = xuvdb_sample_linear(keys, values, n_leaves, leaf_log2, background, o_x, o_y, o_z, s_x, s_y, s_z,
-                                x, y, z + s_z) - xuvdb_sample_linear(keys, values, n_leaves, leaf_log2,
-                                                                    background, o_x, o_y, o_z, s_x, s_y, s_z,
-                                                                    x, y, z - s_z)
-        norm = qd.sqrt(nx * nx + ny * ny + nz * nz)
-        if norm > 1e-12:
-            out[i, 0] = nx / norm
-            out[i, 1] = ny / norm
-            out[i, 2] = nz / norm
+        xi = qd.i64(qd.floor((x - o_x) / s_x + 0.5))
+        yi = qd.i64(qd.floor((y - o_y) / s_y + 0.5))
+        zi = qd.i64(qd.floor((z - o_z) / s_z + 0.5))
+        out[i, 0] = 0.0
+        out[i, 1] = 0.0
+        out[i, 2] = 0.0
+        valid[i] = 0
+        if xuvdb_active_at(keys, mask, n_leaves, leaf_log2, xi, yi, zi) == 1:
+            f0 = xuvdb_sample_linear(keys, values, n_leaves, leaf_log2, background, o_x, o_y, o_z,
+                                     s_x, s_y, s_z, x, y, z)
+            nx = xuvdb_axis_grad(
+                xuvdb_sample_linear(keys, values, n_leaves, leaf_log2, background, o_x, o_y, o_z,
+                                    s_x, s_y, s_z, x + s_x, y, z),
+                xuvdb_sample_linear(keys, values, n_leaves, leaf_log2, background, o_x, o_y, o_z,
+                                    s_x, s_y, s_z, x - s_x, y, z),
+                f0,
+                xuvdb_active_at(keys, mask, n_leaves, leaf_log2, xi + 1, yi, zi),
+                xuvdb_active_at(keys, mask, n_leaves, leaf_log2, xi - 1, yi, zi),
+            )
+            ny = xuvdb_axis_grad(
+                xuvdb_sample_linear(keys, values, n_leaves, leaf_log2, background, o_x, o_y, o_z,
+                                    s_x, s_y, s_z, x, y + s_y, z),
+                xuvdb_sample_linear(keys, values, n_leaves, leaf_log2, background, o_x, o_y, o_z,
+                                    s_x, s_y, s_z, x, y - s_y, z),
+                f0,
+                xuvdb_active_at(keys, mask, n_leaves, leaf_log2, xi, yi + 1, zi),
+                xuvdb_active_at(keys, mask, n_leaves, leaf_log2, xi, yi - 1, zi),
+            )
+            nz = xuvdb_axis_grad(
+                xuvdb_sample_linear(keys, values, n_leaves, leaf_log2, background, o_x, o_y, o_z,
+                                    s_x, s_y, s_z, x, y, z + s_z),
+                xuvdb_sample_linear(keys, values, n_leaves, leaf_log2, background, o_x, o_y, o_z,
+                                    s_x, s_y, s_z, x, y, z - s_z),
+                f0,
+                xuvdb_active_at(keys, mask, n_leaves, leaf_log2, xi, yi, zi + 1),
+                xuvdb_active_at(keys, mask, n_leaves, leaf_log2, xi, yi, zi - 1),
+            )
+            norm = qd.sqrt(nx * nx + ny * ny + nz * nz)
+            if norm > 1e-12:
+                out[i, 0] = nx / norm
+                out[i, 1] = ny / norm
+                out[i, 2] = nz / norm
+            valid[i] = 1
         else:
-            out[i, 0] = 0.0
-            out[i, 1] = 0.0
-            out[i, 2] = 0.0
+            if extend > 0:
+                # Nearest well-conditioned active voxel within Chebyshev distance `extend`.
+                # Primary key = number of active face neighbours (stencil quality): razor-edge
+                # voxels of the outermost band layer have no tangential taps and donate skewed
+                # directions, so they lose to slightly deeper voxels; distance breaks ties.
+                # Scan early-outs once a fully central donor (count 6) is found.
+                best_cnt = -1
+                best = -1
+                dxi = xi
+                dyi = yi
+                dzi = zi
+                for ax in range(0, 2 * extend + 1):
+                    for ay in range(0, 2 * extend + 1):
+                        for az in range(0, 2 * extend + 1):
+                            dx = ax - extend
+                            dy = ay - extend
+                            dz = az - extend
+                            adx = dx
+                            if dx < 0:
+                                adx = -dx
+                            ady = dy
+                            if dy < 0:
+                                ady = -dy
+                            adz = dz
+                            if dz < 0:
+                                adz = -dz
+                            r = adx
+                            if ady > r:
+                                r = ady
+                            if adz > r:
+                                r = adz
+                            if best_cnt < 6:
+                                cx = xi + qd.i64(dx)
+                                cy = yi + qd.i64(dy)
+                                cz = zi + qd.i64(dz)
+                                if xuvdb_active_at(keys, mask, n_leaves, leaf_log2, cx, cy, cz) == 1:
+                                    cnt = xuvdb_active_at(keys, mask, n_leaves, leaf_log2, cx - 1, cy, cz) \
+                                        + xuvdb_active_at(keys, mask, n_leaves, leaf_log2, cx + 1, cy, cz) \
+                                        + xuvdb_active_at(keys, mask, n_leaves, leaf_log2, cx, cy - 1, cz) \
+                                        + xuvdb_active_at(keys, mask, n_leaves, leaf_log2, cx, cy + 1, cz) \
+                                        + xuvdb_active_at(keys, mask, n_leaves, leaf_log2, cx, cy, cz - 1) \
+                                        + xuvdb_active_at(keys, mask, n_leaves, leaf_log2, cx, cy, cz + 1)
+                                    if cnt > best_cnt or (cnt == best_cnt and (best < 0 or r < best)):
+                                        best_cnt = cnt
+                                        best = r
+                                        dxi = cx
+                                        dyi = cy
+                                        dzi = cz
+                if best >= 0:
+                    fv = xuvdb_voxel_value(keys, values, n_leaves, leaf_log2, background, dxi, dyi, dzi)
+                    nx = xuvdb_axis_grad(
+                        xuvdb_voxel_value(keys, values, n_leaves, leaf_log2, background, dxi + 1, dyi, dzi),
+                        xuvdb_voxel_value(keys, values, n_leaves, leaf_log2, background, dxi - 1, dyi, dzi),
+                        fv,
+                        xuvdb_active_at(keys, mask, n_leaves, leaf_log2, dxi + 1, dyi, dzi),
+                        xuvdb_active_at(keys, mask, n_leaves, leaf_log2, dxi - 1, dyi, dzi),
+                    )
+                    ny = xuvdb_axis_grad(
+                        xuvdb_voxel_value(keys, values, n_leaves, leaf_log2, background, dxi, dyi + 1, dzi),
+                        xuvdb_voxel_value(keys, values, n_leaves, leaf_log2, background, dxi, dyi - 1, dzi),
+                        fv,
+                        xuvdb_active_at(keys, mask, n_leaves, leaf_log2, dxi, dyi + 1, dzi),
+                        xuvdb_active_at(keys, mask, n_leaves, leaf_log2, dxi, dyi - 1, dzi),
+                    )
+                    nz = xuvdb_axis_grad(
+                        xuvdb_voxel_value(keys, values, n_leaves, leaf_log2, background, dxi, dyi, dzi + 1),
+                        xuvdb_voxel_value(keys, values, n_leaves, leaf_log2, background, dxi, dyi, dzi - 1),
+                        fv,
+                        xuvdb_active_at(keys, mask, n_leaves, leaf_log2, dxi, dyi, dzi + 1),
+                        xuvdb_active_at(keys, mask, n_leaves, leaf_log2, dxi, dyi, dzi - 1),
+                    )
+                    norm = qd.sqrt(nx * nx + ny * ny + nz * nz)
+                    if norm > 1e-12:
+                        out[i, 0] = nx / norm
+                        out[i, 1] = ny / norm
+                        out[i, 2] = nz / norm
+                    valid[i] = 1
 
 
 @qd.kernel

@@ -645,15 +645,36 @@ class VdbGrid:
         """
         return _sample_quadratic(self, np.atleast_2d(np.asarray(xyz, dtype=np.float64)))[0]
 
-    def sample_gradient(self, xyz, order=1):
-        """Central-difference gradient `(n, 3)` at world points; `order` picks the sampler."""
+    def sample_gradient(self, xyz, order=1, extend=0):
+        """Central-difference gradient `(n, 3)` at world points; `order` picks the sampler.
+
+        Boundary-aware, mirroring `GpuVolume.sdf_normal`: a stencil tap outside the narrow band
+        falls back to a one-sided difference (x2 scaled, so all branches approximate `|grad|`
+        under the common `1/(2h)` factor), and points outside the band get the zero vector
+        instead of 0/0 noise. `extend` is kernel-side only (`GpuVolume.sdf_normal`).
+        """
+        if extend:
+            raise NotImplementedError("extend is supported by GpuVolume.sdf_normal only")
         pts = np.atleast_2d(np.asarray(xyz, dtype=np.float64))
         sampler = _sample_linear if order == 1 else _sample_quadratic
         sx, sy, sz = self.voxel_size
-        gx = sampler(self, pts + [sx, 0, 0]) - sampler(self, pts - [sx, 0, 0])
-        gy = sampler(self, pts + [0, sy, 0]) - sampler(self, pts - [0, sy, 0])
-        gz = sampler(self, pts + [0, 0, sz]) - sampler(self, pts - [0, 0, sz])
-        return np.stack([gx / (2.0 * sx), gy / (2.0 * sy), gz / (2.0 * sz)], axis=1).astype(np.float64)
+        step = np.array([[sx, 0.0, 0.0], [0.0, sy, 0.0], [0.0, 0.0, sz]])
+        f0 = sampler(self, pts)
+        idx = np.rint(self.world_to_index(pts)).astype(np.int64)
+        _, a0 = self.probe_batch(idx)
+        g = []
+        for a in range(3):
+            _, ap = self.probe_batch(np.rint(self.world_to_index(pts + step[a])).astype(np.int64))
+            _, am = self.probe_batch(np.rint(self.world_to_index(pts - step[a])).astype(np.int64))
+            fp = sampler(self, pts + step[a])
+            fm = sampler(self, pts - step[a])
+            ga = np.where(
+                ap & am, fp - fm,
+                np.where(ap, 2.0 * (fp - f0), np.where(am, 2.0 * (f0 - fm), 0.0)),
+            )
+            ga = np.where(a0, ga, 0.0)  # outside the band -> zero vector
+            g.append(ga)
+        return np.stack([g[0] / (2.0 * sx), g[1] / (2.0 * sy), g[2] / (2.0 * sz)], axis=1).astype(np.float64)
 
     _STENCIL7 = ((0, 0, 0), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
     _STENCIL19_EDGES = ((1, 1, 0), (1, -1, 0), (-1, 1, 0), (-1, -1, 0),

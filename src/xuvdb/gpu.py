@@ -85,15 +85,32 @@ class GpuVolume:
             raise ValueError("order must be 0 (nearest), 1 (linear) or 2 (quadratic)")
         return out
 
-    def sdf_normal(self, points):
-        """Central-difference SDF gradient (world-space, normalized) at world-space points."""
+    def sdf_normal(self, points, extend=0, return_valid=False):
+        """Boundary-aware SDF gradient (world-space, unit length) at world-space points.
+
+        Stencil taps outside the narrow band fall back to one-sided differences: band-edge
+        points stay first-order accurate, and deep-background points return the zero vector
+        instead of 0/0 noise. `extend` > 0 dilates the normal field - out-of-band points adopt
+        the normal of the nearest active voxel within Chebyshev distance `extend` (voxels) and
+        are marked valid; points with no donor within `extend` still get the zero vector. With
+        `return_valid=True` also returns a per-point i32 flag: 1 = defined (in-band or
+        extended), 0 = zero vector. Cost note: `extend` scans up to `(2k+1)^3` voxel indices
+        per out-of-band point (early-outs once a fully central donor is found) - keep k small
+        and batch points in one call.
+        """
         points = np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 3)
+        if int(extend) < 0:
+            raise ValueError("extend must be >= 0 (voxels)")
         out = np.empty((len(points), 3), dtype=np.float32)
+        valid = np.zeros(len(points), dtype=np.int32)
         kernels.kernel_sdf_normal(
-            self.keys, self.values, int(self.grid.n_leaves), int(self.grid.leaf_log2), float(self.background),
+            self.keys, self.mask, self.values, int(self.grid.n_leaves), int(self.grid.leaf_log2),
+            float(self.background),
             *(float(v) for v in self.grid.origin_world), *(float(v) for v in self.grid.voxel_size),
-            points, out,
+            points, out, valid, extend=int(extend),
         )
+        if return_valid:
+            return out, valid
         return out
 
     # ------------------------------------------------------------------ rays
